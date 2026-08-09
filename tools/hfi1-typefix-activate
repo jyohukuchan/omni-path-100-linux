@@ -1,0 +1,285 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: GPL-2.0-only
+# Load or restore the PIO_CRED type-fix hfi1 module on either host.
+#
+# The candidate differs from the packaged module only by
+# the two patches in patches/linux-rdma-submission/ and is never
+# written into /lib/modules, so a normal reboot always restores stock.
+#
+# Modes:
+#   --status              report module identity, link state and consumers
+#   --rehearse            unload and reload the STOCK module, to prove the
+#                         link recovers before any candidate is loaded
+#   --activate            swap the stock module for the candidate
+#   --restore             swap the candidate back to the packaged stock module
+#   --install-persistent  also copy the candidate to /lib/modules/<ver>/updates
+#                         so a reboot keeps it; the packaged module is left
+#                         untouched and `--uninstall-persistent` reverts it
+#   --uninstall-persistent  remove that copy and return to the packaged module
+#   --reload              cycle hfi1 with modprobe, so /etc/modprobe.d options
+#                         (for example cap_mask) take effect
+set -Eeuo pipefail
+
+readonly LINK_WAIT_SECONDS=180
+
+host=$(hostnamectl --static 2>/dev/null || hostname)
+case "$host" in
+	t7610)
+		KERNEL=6.17.0-1030-oem
+		STOCK_SRCVERSION=AE5B6BDF7E596E1244033FE
+		TYPEFIX=/var/tmp/t7610-hfi1-submit-verify/source/drivers/infiniband/hw/hfi1/hfi1.ko
+		TYPEFIX_HASH=aca34d756135def5c5beb9d90b192e509b5c207f220414531a2006249f58c1d0
+		EXPECTED_GUID=0011750101088053
+		LOCAL_FM=yes
+		;;
+	homelab1-WRX80-Creator)
+		KERNEL=6.17.0-35-generic
+		STOCK_SRCVERSION=AE5B6BDF7E596E1244033FE
+		TYPEFIX=/var/tmp/wrx80-hfi1-submit-verify-20260809T024341Z/source/drivers/infiniband/hw/hfi1/hfi1.ko
+		TYPEFIX_HASH=1df9a6f7d7aed5ffe2f63f868ef0c60ec1521f79cb36c9a2557fb634a3cd8efb
+		EXPECTED_GUID=0011750101097b95
+		LOCAL_FM=no
+		;;
+	*)
+		printf 'ERROR: unknown host %s\n' "$host" >&2
+		exit 2
+		;;
+esac
+readonly host KERNEL STOCK_SRCVERSION TYPEFIX TYPEFIX_HASH EXPECTED_GUID LOCAL_FM
+readonly TYPEFIX_SRCVERSION=764EE580A197C141E2DCCFC
+readonly STOCK="/lib/modules/$KERNEL/kernel/drivers/infiniband/hw/hfi1/hfi1.ko.zst"
+readonly UPDATES_DIR="/lib/modules/$KERNEL/updates"
+readonly UPDATES_MODULE="$UPDATES_DIR/hfi1.ko"
+
+ipoib_was_loaded=0
+fm_was_active=0
+
+die() {
+	printf 'ERROR: %s\n' "$*" >&2
+	exit 2
+}
+
+log() {
+	printf '%s %s\n' "$(date --iso-8601=seconds)" "$*" >&2
+}
+
+find_active_hfi() {
+	local class_path dev guid state phys_state
+	for class_path in /sys/class/infiniband/*; do
+		[[ -d "$class_path" ]] || continue
+		dev=${class_path##*/}
+		grep -qx 'DRIVER=hfi1' "$class_path/device/uevent" 2>/dev/null || continue
+		guid=$(tr -d ':' <"$class_path/node_guid" 2>/dev/null || true)
+		[[ "$guid" == "$EXPECTED_GUID" ]] || continue
+		state=$(cat "$class_path/ports/1/state" 2>/dev/null || true)
+		phys_state=$(cat "$class_path/ports/1/phys_state" 2>/dev/null || true)
+		[[ "$state" == '4: ACTIVE' && "$phys_state" == '5: LinkUp' ]] || continue
+		printf '%s\n' "$dev"
+		return 0
+	done
+	return 1
+}
+
+wait_link_active() {
+	local second dev
+	for ((second = 1; second <= LINK_WAIT_SECONDS; second++)); do
+		if dev=$(find_active_hfi); then
+			log "link=ACTIVE device=$dev after_seconds=$second"
+			return 0
+		fi
+		sleep 1
+	done
+	log "link=NOT-ACTIVE after ${LINK_WAIT_SECONDS}s"
+	return 1
+}
+
+loaded_srcversion() {
+	cat /sys/module/hfi1/srcversion 2>/dev/null || printf 'not-loaded\n'
+}
+
+no_hfi_consumers() {
+	local rc out
+	out=$(mktemp)
+	set +e
+	fuser -v /dev/hfi1_* >"$out" 2>&1
+	rc=$?
+	set -e
+	if [[ $rc -eq 1 && ! -s "$out" ]]; then
+		rm -f "$out"
+		return 0
+	fi
+	log "hfi-device-consumers-present:"
+	cat "$out" >&2
+	rm -f "$out"
+	return 1
+}
+
+stop_consumers() {
+	if [[ "$LOCAL_FM" == yes ]] && systemctl is-active --quiet opa-fm; then
+		fm_was_active=1
+		systemctl stop opa-fm || die 'opa-fm stop failed'
+		log 'stopped=opa-fm'
+	fi
+	no_hfi_consumers || die 'refusing to unload while /dev/hfi1_* has a consumer'
+	if grep -q '^ib_ipoib ' /proc/modules; then
+		ipoib_was_loaded=1
+		modprobe -r ib_ipoib || die 'ib_ipoib unload failed'
+		log 'unloaded=ib_ipoib'
+	fi
+}
+
+start_consumers() {
+	if [[ $ipoib_was_loaded -eq 1 ]]; then
+		modprobe ib_ipoib && log 'reloaded=ib_ipoib' || log 'WARNING: ib_ipoib reload failed'
+	fi
+	if [[ $fm_was_active -eq 1 ]]; then
+		systemctl start opa-fm && log 'started=opa-fm' || log 'WARNING: opa-fm start failed'
+	fi
+}
+
+unload_hfi1() {
+	modprobe -r hfi1 || die 'hfi1 unload failed; not forcing'
+	grep -q '^hfi1 ' /proc/modules && die 'hfi1 still present after unload'
+	log 'unloaded=hfi1'
+}
+
+status() {
+	local dev
+	printf 'host=%s kernel=%s\n' "$host" "$(uname -r)"
+	printf 'loaded_srcversion=%s ' "$(loaded_srcversion)"
+	case "$(loaded_srcversion)" in
+		"$STOCK_SRCVERSION") printf '(stock)\n' ;;
+		"$TYPEFIX_SRCVERSION") printf '(type-fix candidate)\n' ;;
+		*) printf '(unrecognised)\n' ;;
+	esac
+	printf 'stock_module=%s\n' "$STOCK"
+	printf 'candidate_module=%s\n' "$TYPEFIX"
+	printf 'modprobe_would_load=%s\n' "$(modinfo -n hfi1)"
+	printf 'tainted=%s\n' "$(cat /proc/sys/kernel/tainted)"
+	if dev=$(find_active_hfi); then
+		printf 'link=ACTIVE device=%s rate=%s\n' "$dev" "$(cat "/sys/class/infiniband/$dev/ports/1/rate")"
+	else
+		printf 'link=NOT-ACTIVE\n'
+	fi
+	[[ "$LOCAL_FM" == yes ]] && printf 'opa_fm=%s\n' "$(systemctl is-active opa-fm)"
+	fuser -v /dev/hfi1_* 2>&1 | sed 's/^/consumer: /' || true
+}
+
+preflight_common() {
+	[[ ${EUID} -eq 0 ]] || die 'must run as root'
+	[[ $(uname -r) == "$KERNEL" ]] || die "unexpected kernel $(uname -r)"
+	grep -qx 'SecureBoot disabled' < <(mokutil --sb-state) || die 'Secure Boot is not disabled'
+	[[ -r "$STOCK" ]] || die "packaged stock module missing at $STOCK"
+}
+
+rehearse() {
+	preflight_common
+	[[ $(loaded_srcversion) == "$STOCK_SRCVERSION" ]] || die 'loaded module is not the packaged stock module'
+	log 'rehearsal=begin purpose=prove the link recovers from a stock unload/reload'
+	stop_consumers
+	unload_hfi1
+	modprobe hfi1 || die 'stock hfi1 reload failed'
+	[[ $(loaded_srcversion) == "$STOCK_SRCVERSION" ]] || die 'reloaded module is not stock'
+	log 'reloaded=stock-hfi1'
+	start_consumers
+	wait_link_active || die 'link did not return to ACTIVE after a stock reload'
+	log 'rehearsal=PASS'
+	status
+}
+
+activate() {
+	preflight_common
+	[[ -r "$TYPEFIX" ]] || die "candidate module missing at $TYPEFIX"
+	[[ $(sha256sum "$TYPEFIX" | awk '{print $1}') == "$TYPEFIX_HASH" ]] || die 'candidate hash mismatch'
+	[[ $(modinfo -F srcversion "$TYPEFIX") == "$TYPEFIX_SRCVERSION" ]] || die 'candidate srcversion mismatch'
+	[[ $(modinfo -F vermagic "$TYPEFIX") == $(modinfo -F vermagic "$STOCK") ]] || die 'candidate vermagic mismatch'
+	[[ $(loaded_srcversion) == "$STOCK_SRCVERSION" ]] || die 'loaded module is not the packaged stock module'
+	log "activate=begin candidate=$TYPEFIX"
+	stop_consumers
+	unload_hfi1
+	modprobe rdmavt || true
+	modprobe i2c-algo-bit || true
+	insmod "$TYPEFIX" || { log 'insmod failed; restoring stock'; modprobe hfi1; start_consumers; die 'candidate insmod failed'; }
+	[[ $(loaded_srcversion) == "$TYPEFIX_SRCVERSION" ]] || die 'loaded module is not the candidate'
+	log "loaded=type-fix-candidate srcversion=$TYPEFIX_SRCVERSION"
+	start_consumers
+	wait_link_active || log 'WARNING: link not ACTIVE yet; check the fabric manager'
+	status
+}
+
+restore() {
+	preflight_common
+	[[ $(loaded_srcversion) != "$STOCK_SRCVERSION" ]] || die 'the packaged stock module is already loaded'
+	log "restore=begin from_srcversion=$(loaded_srcversion)"
+	stop_consumers
+	unload_hfi1
+	modprobe hfi1 || die 'stock hfi1 reload failed'
+	[[ $(loaded_srcversion) == "$STOCK_SRCVERSION" ]] || die 'reloaded module is not stock'
+	log 'restored=packaged-stock-hfi1'
+	start_consumers
+	wait_link_active || log 'WARNING: link not ACTIVE yet; check the fabric manager'
+	status
+}
+
+reload_module() {
+	preflight_common
+	log "reload=begin loaded_srcversion=$(loaded_srcversion)"
+	stop_consumers
+	unload_hfi1
+	modprobe hfi1 || die 'hfi1 reload failed'
+	log "reloaded=$(modinfo -n hfi1) srcversion=$(loaded_srcversion)"
+	printf 'cap_mask=%s\n' "$(cat /sys/module/hfi1/parameters/cap_mask)" >&2
+	start_consumers
+	wait_link_active || log 'WARNING: link not ACTIVE yet; check the fabric manager'
+	status
+}
+
+install_persistent() {
+	preflight_common
+	[[ -r "$TYPEFIX" ]] || die "candidate module missing at $TYPEFIX"
+	[[ $(sha256sum "$TYPEFIX" | awk '{print $1}') == "$TYPEFIX_HASH" ]] || die 'candidate hash mismatch'
+	install -d -o root -g root -m 0755 "$UPDATES_DIR"
+	install -o root -g root -m 0644 "$TYPEFIX" "$UPDATES_MODULE"
+	depmod -a "$KERNEL"
+	[[ $(modinfo -n hfi1) == "$UPDATES_MODULE" ]] || die 'depmod did not prefer the updates/ copy'
+	log "installed_persistent=$UPDATES_MODULE packaged_module_untouched=yes"
+	printf 'modinfo -n hfi1 -> %s\n' "$(modinfo -n hfi1)"
+}
+
+unreload_module() {
+	preflight_common
+	log "reload=begin loaded_srcversion=$(loaded_srcversion)"
+	stop_consumers
+	unload_hfi1
+	modprobe hfi1 || die 'hfi1 reload failed'
+	log "reloaded=$(modinfo -n hfi1) srcversion=$(loaded_srcversion)"
+	printf 'cap_mask=%s\n' "$(cat /sys/module/hfi1/parameters/cap_mask)" >&2
+	start_consumers
+	wait_link_active || log 'WARNING: link not ACTIVE yet; check the fabric manager'
+	status
+}
+
+install_persistent() {
+	preflight_common
+	[[ -e "$UPDATES_MODULE" ]] || die 'no persistent copy is installed'
+	rm -f -- "$UPDATES_MODULE"
+	rmdir --ignore-fail-on-non-empty "$UPDATES_DIR" 2>/dev/null || true
+	depmod -a "$KERNEL"
+	[[ $(modinfo -n hfi1) == "$STOCK" ]] || die 'the packaged module is not selected again'
+	log 'uninstalled_persistent=yes'
+	printf 'modinfo -n hfi1 -> %s\n' "$(modinfo -n hfi1)"
+}
+
+case ${1:-} in
+	--status) status ;;
+	--reload) reload_module ;;
+	--install-persistent) install_persistent ;;
+	--uninstall-persistent) uninstall_persistent ;;
+	--rehearse) rehearse ;;
+	--activate) activate ;;
+	--restore) restore ;;
+	*)
+		printf 'usage: %s --status | --rehearse | --activate | --restore | --reload | --install-persistent | --uninstall-persistent\n' "$0" >&2
+		exit 2
+		;;
+esac

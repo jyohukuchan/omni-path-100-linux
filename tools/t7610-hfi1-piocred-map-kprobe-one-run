@@ -1,0 +1,560 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: GPL-2.0-only
+# T7610-only, root-only, one-shot capture of the arguments HFI1 hands to the
+# kernel mapping helpers for the type-3 PIO_CRED / sc_credits_addr mapping.
+#
+# Purpose: the faulting PTE 800049168e911235 carries frame 0x49168e911000
+# (~80 TiB), above this host's 46-bit MAXPHYADDR.  This runner records the
+# actual dma_addr_t / pfn the driver passes, so the origin of that frame is
+# measured rather than inferred.
+#
+# `--run` uses the STOCK module.  `--run-typefix` temporarily insmods the
+# hash-pinned PIO_CRED type-fix candidate for one endpoint attempt.  Neither
+# mode writes a module tree or boot configuration, and neither contacts WRX80;
+# a normal reboot is always the rollback.
+set -Eeuo pipefail
+
+readonly EXPECTED_HOST=t7610
+readonly EXPECTED_KERNEL=6.17.0-1030-oem
+readonly STOCK=/lib/modules/6.17.0-1030-oem/kernel/drivers/infiniband/hw/hfi1/hfi1.ko.zst
+readonly STOCK_HASH=8a64cd2ae769a2e26de0ebc3ab7622bb8f003bf4509c1c67054be2218398bff9
+readonly STOCK_SRCVERSION=AE5B6BDF7E596E1244033FE
+readonly EXPECTED_GUID=0011750101088053
+readonly HFI_DEV=/dev/hfi1_0
+# Type-fix candidate: PIO_CRED byte offset added to a `struct credit_return *`.
+readonly TYPEFIX_BUNDLE=/var/tmp/opa-hfi1-piocred-typefix-build-20260804T162821Z
+readonly TYPEFIX="$TYPEFIX_BUNDLE/source/drivers/infiniband/hw/hfi1/hfi1.ko"
+readonly TYPEFIX_HASH=90459ba5a9a0b5de121c720c33ad8780753019bb0592eba29b6c54c71c253ae9
+readonly TYPEFIX_SRCVERSION=DF441A393ED48923068892C
+readonly PROBE_ROOT=/var/tmp/opa-psm2-fault-trace/build-20260804T131836Z
+readonly PROBE="$PROBE_ROOT/bin/psm2_ep_open_probe"
+readonly PROBE_SOURCE="$PROBE_ROOT/psm2_ep_open_probe.c"
+readonly PROBE_HASH=760ae0d2a09876c05e30af2c14d9320c6fa6f618200f7e7d2526b7815830609c
+readonly PROBE_SOURCE_HASH=4ffa32f10b67a244e486322b6031980cf51861ee7348ce142a6cb00f2c532dbb
+readonly PSM_LIB="$PROBE_ROOT/lib/libpsm2.so.2"
+readonly PSM_LIB_HASH=5454a793b637bda85e03cfa3d02f3ed05da6e93bf3f8482d1dba0866d3055b6c
+# Distribution libpsm2-2 11.2.185-2build1, used to test whether the AVX2
+# SIGILL in the locally built library is a build-flag artefact.
+readonly DISTRO_PSM_DIR=/usr/lib/x86_64-linux-gnu
+readonly DISTRO_PSM_LIB="$DISTRO_PSM_DIR/libpsm2.so.2.2"
+readonly DISTRO_PSM_LIB_HASH=7adf30d691afa1b208f592d5bd6bdca8dc840cf745f01af80da715d34b2e9ba2
+# opa-psm2 3f7c29811e820bc5645cbcad6a4c9d61133f3156 rebuilt with
+# PSM_DISABLE_AVX2=1, so it carries no AVX2-only instruction for this CPU.
+readonly NOAVX2_PSM_DIR=/var/tmp/opa-psm2-noavx2-lib
+readonly NOAVX2_PSM_LIB="$NOAVX2_PSM_DIR/libpsm2.so.2.2"
+readonly NOAVX2_PSM_LIB_HASH=a116ef592ab3faa9268dfd8aab14387f83bd59bdbc77f825159002a0dbba16ef
+readonly ROOT=/var/tmp/opa-hfi1-piocred-kprobe-one-run
+readonly RUNS="$ROOT/runs"
+readonly FUSE="$ROOT/RUN-ONCE-CONSUMED"
+readonly LATEST_RUN="$ROOT/latest-run"
+readonly SHIM_ROOT=/var/tmp/opa-hfi1-piocred-kprobe-shims
+readonly TRACE_ROOT=/sys/kernel/tracing
+readonly TRACE_NAME=hfi1_piocred_map
+readonly KPROBE_GROUP=hfi1map
+readonly PROBE_COMM=psm2_ep_open_pr
+readonly WATCHDOG_SECONDS=120
+readonly WATCHDOG_KILL_AFTER_SECONDS=20
+
+# type:name:symbol:argument specification.  x86-64 SysV entry registers are
+# used directly; `$arg1`-style BTF arguments are not available on this kernel.
+# The KASLR bases are read on the iommu_dma_mmap event so that the
+# cpu_addr -> pfn arithmetic can be checked within the same boot.
+readonly KPROBE_SPECS=(
+	'p:iommu_dma_mmap:iommu_dma_mmap:dev=%di vma=%si cpu_addr=%dx dma_addr=%cx size=%r8 pob=@page_offset_base:x64 vmalloc_base=@vmalloc_base:x64 vmemmap_base=@vmemmap_base:x64'
+	'p:dma_direct_mmap:dma_direct_mmap:dev=%di vma=%si cpu_addr=%dx dma_addr=%cx size=%r8'
+	'p:dma_common_mmap:dma_common_mmap:dev=%di vma=%si cpu_addr=%dx dma_addr=%cx size=%r8'
+	'p:dma_common_find_pages:dma_common_find_pages:cpu_addr=%di'
+	'r:dma_common_find_pages_ret:dma_common_find_pages:pages=$retval'
+	'p:vmalloc_to_pfn:vmalloc_to_pfn:addr=%di'
+	'r:vmalloc_to_pfn_ret:vmalloc_to_pfn:pfn=$retval'
+	'p:remap_pfn_range:remap_pfn_range:vma=%di addr=%si pfn=%dx size=%cx'
+	'p:vm_map_pages:vm_map_pages:vma=%di pages=%si num=%dx'
+	'p:vm_insert_page:vm_insert_page:vma=%di addr=%si page=%dx'
+	'p:vmf_insert_pfn:vmf_insert_pfn:vma=%di addr=%si pfn=%dx'
+)
+readonly FTRACE_FUNCTIONS=(hfi1_file_open hfi1_file_ioctl hfi1_file_mmap hfi1_file_close)
+
+evidence=
+shim=
+trace_instance=
+kprobes_created=0
+reboot_requested=0
+preflight_error=
+module_mode=stock
+psm_lib_mode=instrumented
+patched_module_active=0
+
+die() {
+	printf 'ERROR: %s\n' "$*" >&2
+	exit 2
+}
+
+record() {
+	printf '%s %s\n' "$(date --iso-8601=seconds)" "$*" | tee -a "$evidence/runner.log" >&2
+}
+
+snapshot() {
+	local label=$1
+	local out="$evidence/$label"
+	mkdir -p "$out/pstore"
+	date --iso-8601=seconds >"$out/captured-at.txt"
+	dmesg -T >"$out/dmesg.txt" 2>&1 || true
+	journalctl -k -b --no-pager -o short-iso >"$out/journal-kernel-current-boot.txt" 2>&1 || true
+	journalctl -k -b -1 --no-pager -o short-iso >"$out/journal-kernel-previous-boot.txt" 2>&1 || true
+	find /sys/fs/pstore -maxdepth 1 -type f -printf '%f %s bytes\n' >"$out/pstore-index.txt" 2>&1 || true
+	find /sys/fs/pstore -maxdepth 1 -type f -exec cp -a -- {} "$out/pstore/" \; 2>/dev/null || true
+	{
+		printf 'kernel='; uname -r
+		printf 'cmdline='; cat /proc/cmdline
+		printf 'tainted='; cat /proc/sys/kernel/tainted
+		printf 'hfi1_srcversion='; cat /sys/module/hfi1/srcversion 2>&1 || true
+		grep -m1 'address sizes' /proc/cpuinfo
+		grep MemTotal /proc/meminfo
+		printf 'iommu_group_type='; cat /sys/bus/pci/devices/0000:81:00.0/iommu_group/type 2>&1 || true
+		printf 'dma_mask_bits='; cat /sys/bus/pci/devices/0000:81:00.0/dma_mask_bits 2>&1 || true
+		rdma link show
+		ibstat
+		systemctl status --no-pager -n 0 opa-fm
+	} >"$out/runtime-status.txt" 2>&1 || true
+}
+
+find_active_hfi() {
+	local class_path dev guid state phys_state
+	for class_path in /sys/class/infiniband/*; do
+		[[ -d "$class_path" ]] || continue
+		dev=${class_path##*/}
+		grep -qx 'DRIVER=hfi1' "$class_path/device/uevent" 2>/dev/null || continue
+		guid=$(tr -d ':' <"$class_path/node_guid" 2>/dev/null || true)
+		[[ "$guid" == "$EXPECTED_GUID" ]] || continue
+		state=$(cat "$class_path/ports/1/state" 2>/dev/null || true)
+		phys_state=$(cat "$class_path/ports/1/phys_state" 2>/dev/null || true)
+		[[ "$state" == '4: ACTIVE' && "$phys_state" == '5: LinkUp' ]] || continue
+		printf '%s\n' "$dev"
+		return 0
+	done
+	return 1
+}
+
+record_hfi() {
+	local label=$1
+	local dev=$2
+	local class_path="/sys/class/infiniband/$2"
+	{
+		printf 'rdma_device=%s\n' "$dev"
+		cat "$class_path/device/uevent"
+		printf 'node_guid='; cat "$class_path/node_guid"
+		printf 'port_state='; cat "$class_path/ports/1/state"
+		printf 'physical_state='; cat "$class_path/ports/1/phys_state"
+	} >"$evidence/${label}-hfi.txt"
+}
+
+no_hfi_consumers() {
+	local destination=$1
+	local rc
+	set +e
+	fuser -v "$HFI_DEV" >"$destination" 2>&1
+	rc=$?
+	set -e
+	[[ $rc -eq 1 && ! -s "$destination" ]]
+}
+
+wait_active_hfi_and_fm() {
+	local second dev
+	for ((second = 1; second <= 90; second++)); do
+		if dev=$(find_active_hfi) && systemctl is-active --quiet opa-fm; then
+			record_hfi patched-active "$dev"
+			record "patched_hfi_active_after_seconds=$second rdma_device=$dev opa_fm=active"
+			printf '%s\n' "$dev"
+			return 0
+		fi
+		sleep 1
+	done
+	return 1
+}
+
+load_typefix_module() {
+	local dependency
+	systemctl stop opa-fm || reboot_stock 'opa-fm-stop-failed'
+	no_hfi_consumers "$evidence/post-stop-fuser.txt" || reboot_stock 'hfi-device-has-consumer-after-opa-fm-stop'
+	if grep -q '^ib_ipoib ' /proc/modules; then
+		modprobe -r ib_ipoib || reboot_stock 'ib-ipoib-unload-failed'
+		record 'unloaded_module=ib_ipoib'
+	fi
+	modprobe -r hfi1 || reboot_stock 'hfi1-unload-failed'
+	grep -q '^hfi1 ' /proc/modules && reboot_stock 'hfi1-remains-loaded'
+	record 'unloaded_module=hfi1'
+	for dependency in rdmavt ib_core i2c-algo-bit; do
+		modprobe "$dependency" || reboot_stock "dependency-load-failed-$dependency"
+	done
+	insmod "$TYPEFIX" || reboot_stock 'typefix-hfi1-insert-failed'
+	patched_module_active=1
+	grep -q '^hfi1 ' /proc/modules || reboot_stock 'typefix-hfi1-not-loaded'
+	[[ $(cat /sys/module/hfi1/srcversion) == "$TYPEFIX_SRCVERSION" ]] || reboot_stock 'typefix-hfi1-srcversion-mismatch'
+	record "typefix_module=loaded hash=$TYPEFIX_HASH srcversion=$TYPEFIX_SRCVERSION"
+	systemctl start opa-fm || reboot_stock 'opa-fm-start-failed'
+}
+
+cleanup_shim() {
+	[[ -n "$shim" ]] || return 0
+	case "$shim" in
+		"$SHIM_ROOT"/*) ;;
+		*) return 0 ;;
+	esac
+	[[ -L "$shim/hfi1_0" ]] && rm -f -- "$shim/hfi1_0"
+	rmdir -- "$shim" 2>/dev/null || true
+	shim=
+}
+
+remove_kprobes() {
+	local spec name rest
+	[[ $kprobes_created -eq 1 ]] || return 0
+	for spec in "${KPROBE_SPECS[@]}"; do
+		rest=${spec#*:}
+		name=${rest%%:*}
+		[[ ! -e "$trace_instance/events/$KPROBE_GROUP/$name/enable" ]] ||
+			printf '0' >"$trace_instance/events/$KPROBE_GROUP/$name/enable" 2>/dev/null || true
+		printf -- '-:%s/%s\n' "$KPROBE_GROUP" "$name" >>"$TRACE_ROOT/dynamic_events" 2>/dev/null || true
+	done
+	kprobes_created=0
+}
+
+collect_trace() {
+	[[ -n "$trace_instance" && -d "$trace_instance" ]] || return 0
+	printf '0' >"$trace_instance/tracing_on" 2>/dev/null || true
+	cat "$trace_instance/trace" >"$evidence/trace-map-path.txt" 2>&1 || true
+	cat "$trace_instance/set_ftrace_filter" >"$evidence/trace-function-filter.txt" 2>&1 || true
+	remove_kprobes
+	rmdir "$trace_instance" 2>/dev/null || true
+	trace_instance=
+}
+
+prepare_trace() {
+	local function_name spec type name symbol args rest
+	[[ -d "$TRACE_ROOT/instances" && -w "$TRACE_ROOT/instances" ]] || return 1
+	[[ -w "$TRACE_ROOT/dynamic_events" ]] || return 1
+	for function_name in "${FTRACE_FUNCTIONS[@]}"; do
+		grep -Eq "^${function_name}[[:space:]]" "$TRACE_ROOT/available_filter_functions" || return 1
+	done
+	for spec in "${KPROBE_SPECS[@]}"; do
+		rest=${spec#*:}; symbol=${rest#*:}; symbol=${symbol%%:*}
+		grep -Eq " ${symbol}\$" /proc/kallsyms || return 1
+	done
+
+	trace_instance="$TRACE_ROOT/instances/${TRACE_NAME}_$$"
+	mkdir "$trace_instance" || return 1
+	printf '0' >"$trace_instance/tracing_on"
+	printf 'nop' >"$trace_instance/current_tracer"
+	: >"$trace_instance/set_ftrace_filter"
+	for function_name in "${FTRACE_FUNCTIONS[@]}"; do
+		printf '%s\n' "$function_name" >>"$trace_instance/set_ftrace_filter"
+	done
+	printf 'function' >"$trace_instance/current_tracer"
+
+	# Kprobe events are created globally and enabled only in this instance.
+	for spec in "${KPROBE_SPECS[@]}"; do
+		type=${spec%%:*}
+		rest=${spec#*:}
+		name=${rest%%:*}
+		symbol=${rest#*:}; symbol=${symbol%%:*}
+		args=${spec#*:*:*:}
+		printf '%s:%s/%s %s %s\n' "$type" "$KPROBE_GROUP" "$name" "$symbol" "$args" \
+			>>"$TRACE_ROOT/dynamic_events" || return 1
+		kprobes_created=1
+		[[ -e "$trace_instance/events/$KPROBE_GROUP/$name/enable" ]] || return 1
+		printf 'comm == "%s"' "$PROBE_COMM" \
+			>"$trace_instance/events/$KPROBE_GROUP/$name/filter" 2>/dev/null || true
+		printf '1' >"$trace_instance/events/$KPROBE_GROUP/$name/enable" || return 1
+	done
+	printf '1' >"$trace_instance/tracing_on"
+}
+
+reboot_stock() {
+	local reason=$1
+	reboot_requested=1
+	record "rollback=normal-reboot-to-unchanged-stock reason=$reason"
+	collect_trace
+	cleanup_shim
+	snapshot "before-reboot-${reason//[^a-zA-Z0-9._-]/_}"
+	sync
+	trap - ERR
+	systemctl reboot || /sbin/reboot
+	exit 1
+}
+
+fail_preflight() {
+	record "preflight_failed=$1"
+	collect_trace
+	cleanup_shim
+	snapshot preflight-failure
+	exit 2
+}
+
+# Abort a run: once the candidate module is live, only a reboot is a safe exit.
+abort_run() {
+	local reason=$1
+	if [[ $patched_module_active -eq 1 ]]; then
+		reboot_stock "$reason"
+	fi
+	fail_preflight "$reason"
+}
+
+unexpected_error() {
+	local status=$?
+	set +e
+	if [[ $reboot_requested -eq 0 ]]; then
+		record "unexpected_error_status=$status"
+		reboot_stock unexpected-error
+	fi
+	exit "$status"
+}
+
+claim_fuse() {
+	if ! (set -o noclobber; : >"$FUSE") 2>/dev/null; then
+		return 1
+	fi
+	{
+		printf 'claimed_at='; date --iso-8601=seconds
+		printf 'host=%s\n' "$EXPECTED_HOST"
+		printf 'purpose=one stock-module psm2_ep_open with PIO_CRED mapping kprobes\n'
+	} >"$FUSE"
+	chmod 0600 "$FUSE"
+}
+
+verify_hashes_and_probe() {
+	[[ -r "$STOCK" && -x "$PROBE" && -r "$PROBE_SOURCE" && -r "$PSM_LIB" ]] || return 1
+	sha256sum "$STOCK" "$PROBE" "$PROBE_SOURCE" "$PSM_LIB" >"$evidence/preflight-sha256sums.txt"
+	if [[ "$psm_lib_mode" == distro ]]; then
+		[[ -r "$DISTRO_PSM_LIB" ]] || return 1
+		sha256sum "$DISTRO_PSM_LIB" >>"$evidence/preflight-sha256sums.txt"
+		[[ $(sha256sum "$DISTRO_PSM_LIB" | awk '{print $1}') == "$DISTRO_PSM_LIB_HASH" ]] || return 1
+	fi
+	if [[ "$psm_lib_mode" == noavx2 ]]; then
+		[[ -r "$NOAVX2_PSM_LIB" ]] || return 1
+		sha256sum "$NOAVX2_PSM_LIB" >>"$evidence/preflight-sha256sums.txt"
+		[[ $(sha256sum "$NOAVX2_PSM_LIB" | awk '{print $1}') == "$NOAVX2_PSM_LIB_HASH" ]] || return 1
+		[[ -z $(objdump -d "$NOAVX2_PSM_LIB" | grep -oE 'vpbroadcast[a-z]|vperm2i128|vpermq|vinserti128') ]] || return 1
+	fi
+	if [[ "$module_mode" == patched ]]; then
+		[[ -r "$TYPEFIX" ]] || return 1
+		sha256sum "$TYPEFIX" >>"$evidence/preflight-sha256sums.txt"
+		[[ $(sha256sum "$TYPEFIX" | awk '{print $1}') == "$TYPEFIX_HASH" ]] || return 1
+		[[ $(modinfo -F srcversion "$TYPEFIX") == "$TYPEFIX_SRCVERSION" ]] || return 1
+		[[ $(modinfo -F vermagic "$TYPEFIX") == $(modinfo -F vermagic "$STOCK") ]] || return 1
+		[[ $(modinfo -F depends "$TYPEFIX") == 'rdmavt,ib_core,i2c-algo-bit' ]] || return 1
+		grep -qx 'SecureBoot disabled' < <(mokutil --sb-state) || return 1
+	fi
+	[[ $(sha256sum "$STOCK" | awk '{print $1}') == "$STOCK_HASH" ]] || return 1
+	[[ $(sha256sum "$PROBE" | awk '{print $1}') == "$PROBE_HASH" ]] || return 1
+	[[ $(sha256sum "$PROBE_SOURCE" | awk '{print $1}') == "$PROBE_SOURCE_HASH" ]] || return 1
+	[[ $(sha256sum "$PSM_LIB" | awk '{print $1}') == "$PSM_LIB_HASH" ]] || return 1
+	ldd "$PROBE" >"$evidence/preflight-probe-ldd.txt"
+	grep -Fq "libpsm2.so.2 => $PROBE_ROOT/bin/../lib/libpsm2.so.2" "$evidence/preflight-probe-ldd.txt" || return 1
+}
+
+prepare_evidence() {
+	local mode=$1
+	install -d -o root -g root -m 0700 "$ROOT" "$RUNS"
+	exec 9>"$ROOT/.runner.lock"
+	flock -n 9 || die 'another kprobe runner invocation is active'
+	evidence=$(mktemp -d "$RUNS/$(date -u +%Y%m%dT%H%M%SZ)-${mode}-XXXXXX")
+	chmod 0700 "$evidence"
+}
+
+run_preflight() {
+	local dev
+	preflight_error=
+	verify_hashes_and_probe || { preflight_error=hash-or-probe-rpath-validation-failed; return 1; }
+	[[ $(modinfo -n hfi1) == "$STOCK" ]] || { preflight_error=loaded-hfi1-is-not-packaged-stock-path; return 1; }
+	[[ $(cat /sys/module/hfi1/srcversion) == "$STOCK_SRCVERSION" ]] || { preflight_error=loaded-hfi1-is-not-stock-srcversion; return 1; }
+	[[ $(cat /proc/sys/kernel/tainted) == 0 ]] || { preflight_error=kernel-tainted-before-run; return 1; }
+	command -v strace >/dev/null || { preflight_error=strace-unavailable; return 1; }
+	command -v timeout >/dev/null || { preflight_error=timeout-unavailable; return 1; }
+	command -v setpriv >/dev/null || { preflight_error=setpriv-unavailable; return 1; }
+	[[ -d "$TRACE_ROOT/instances" && -w "$TRACE_ROOT/instances" ]] || { preflight_error=tracefs-instances-unavailable; return 1; }
+	[[ -w "$TRACE_ROOT/dynamic_events" ]] || { preflight_error=dynamic-events-unavailable; return 1; }
+	id user >/dev/null || { preflight_error=required-user-account-missing; return 1; }
+	systemctl is-active --quiet opa-fm || { preflight_error=opa-fm-not-active; return 1; }
+	dev=$(find_active_hfi) || { preflight_error=stock-hfi-not-active-guid-driver-match; return 1; }
+	record_hfi preflight "$dev"
+	no_hfi_consumers "$evidence/preflight-fuser.txt" || { preflight_error=hfi-device-has-consumer; return 1; }
+	snapshot preflight-pass
+	record 'preflight=PASS module_operations=none fuse_consumed=no'
+}
+
+setup_shim() {
+	local dev=$1
+	install -d -o root -g root -m 0711 "$SHIM_ROOT"
+	shim=$(mktemp -d "$SHIM_ROOT/$(date -u +%Y%m%dT%H%M%SZ)-XXXXXX")
+	chown user:user "$shim"
+	chmod 0700 "$shim"
+	ln -s "/sys/class/infiniband/$dev" "$shim/hfi1_0"
+	test -L "$shim/hfi1_0" || return 1
+	test -r "$shim/hfi1_0/ports/1/state" || return 1
+	[[ $(cat "$shim/hfi1_0/ports/1/state") == '4: ACTIVE' ]] || return 1
+}
+
+run_once() {
+	local dev endpoint_status psm_lib_env=
+	[[ ${EUID} -eq 0 ]] || die 'must run as root'
+	[[ $(hostnamectl --static 2>/dev/null || hostname) == "$EXPECTED_HOST" ]] || die 'refusing non-T7610 host'
+	[[ $(uname -r) == "$EXPECTED_KERNEL" ]] || die 'unexpected kernel'
+
+	prepare_evidence "run-$module_mode"
+	trap unexpected_error ERR
+	record 'physical_recovery=explicit user authorization: T7610 console/watchdog/physical recovery available'
+	record "scope=T7610 only; module_mode=$module_mode; no boot-config change, no WRX80 operation"
+	record 'contract=one psm2_init then one psm2_ep_open, with mapping-path kprobes armed'
+	if [[ "$psm_lib_mode" == distro ]]; then
+		psm_lib_env="LD_LIBRARY_PATH=$DISTRO_PSM_DIR"
+		record "psm2_library=distro path=$DISTRO_PSM_LIB (RUNPATH is searched after LD_LIBRARY_PATH)"
+	elif [[ "$psm_lib_mode" == noavx2 ]]; then
+		psm_lib_env="LD_LIBRARY_PATH=$NOAVX2_PSM_DIR"
+		record "psm2_library=noavx2 path=$NOAVX2_PSM_LIB avx2_only_instructions=0"
+	else
+		record "psm2_library=instrumented path=$PSM_LIB"
+	fi
+
+	run_preflight || fail_preflight "$preflight_error"
+	printf '%s\n' "$evidence" >"$LATEST_RUN"
+	chmod 0600 "$LATEST_RUN"
+
+	if [[ "$module_mode" == patched ]]; then
+		load_typefix_module
+		dev=$(wait_active_hfi_and_fm) || reboot_stock 'typefix-hfi-or-opa-fm-not-active'
+	fi
+
+	dev=$(find_active_hfi) || abort_run 'hfi-disappeared-after-preflight'
+	setup_shim "$dev" || abort_run 'shim-gates-failed'
+	record "shim_gates=PASS hfi_sysfs_path=$shim/hfi1_0 rdma_device=$dev"
+
+	prepare_trace || abort_run 'mapping-kprobe-or-ftrace-setup-failed'
+	cat "$TRACE_ROOT/dynamic_events" >"$evidence/dynamic-events.txt" 2>&1 || true
+	record "trace=armed kprobes=${#KPROBE_SPECS[@]} instance=$trace_instance"
+
+	[[ ! -e "$FUSE" ]] || abort_run 'fuse-already-consumed'
+	claim_fuse || abort_run 'fuse-claim-failed'
+	record "fuse=consumed path=$FUSE endpoint_execution=starting"
+	snapshot pre-endpoint
+
+	# The probe is expected to die on the known fault.  Keep its non-zero exit
+	# inside an AND-OR list so it neither trips errexit nor the ERR trap; the
+	# clean endpoint-finished path must still run.
+	endpoint_status=0
+	timeout --foreground --signal=TERM --kill-after="${WATCHDOG_KILL_AFTER_SECONDS}s" "${WATCHDOG_SECONDS}s" \
+		strace -f -ttt -T -yy -s 512 -o "$evidence/strace-ioctl-mmap.txt" \
+		-e trace=ioctl,mmap -- \
+		setpriv --reuid=user --regid=user --init-groups \
+		/usr/bin/env -i "HFI_SYSFS_PATH=$shim/hfi1_0" PSM2_HFI1_MAP_TRACE=1 \
+		${psm_lib_env:+"$psm_lib_env"} \
+		"$PROBE" >"$evidence/probe-stdout.txt" 2>"$evidence/probe-stderr.txt" ||
+		endpoint_status=$?
+	printf '%s\n' "$endpoint_status" >"$evidence/probe-exit-status.txt"
+	record "endpoint_exit_status=$endpoint_status endpoint_execution=finished"
+	collect_trace
+	cleanup_shim
+	snapshot endpoint-finished
+	reboot_stock endpoint-finished
+}
+
+dry_run() {
+	[[ ${EUID} -eq 0 ]] || die 'must run as root'
+	[[ $(hostnamectl --static 2>/dev/null || hostname) == "$EXPECTED_HOST" ]] || die 'refusing non-T7610 host'
+	[[ $(uname -r) == "$EXPECTED_KERNEL" ]] || die 'unexpected kernel'
+	prepare_evidence dry-run
+	record 'dry_run=begin module_operations=no fuse_operations=no endpoint_execution=no'
+	if run_preflight; then
+		if prepare_trace; then
+			cat "$TRACE_ROOT/dynamic_events" >"$evidence/dynamic-events.txt" 2>&1 || true
+			record "dry_run_trace=PASS kprobes=${#KPROBE_SPECS[@]} instance=$trace_instance"
+			collect_trace
+			record 'dry_run_trace=PASS instance=torn-down kprobes=removed'
+			cat "$TRACE_ROOT/dynamic_events" >"$evidence/dynamic-events-after-teardown.txt" 2>&1 || true
+		else
+			collect_trace
+			record 'dry_run_trace=FAIL mapping-kprobe-or-ftrace-setup-failed'
+			printf '2\n' >"$evidence/dry-run-exit-status.txt"
+			return 2
+		fi
+		record 'dry_run=PASS module_operations=no fuse_operations=no endpoint_execution=no'
+		printf '0\n' >"$evidence/dry-run-exit-status.txt"
+		printf '%s\n' "$evidence"
+		return 0
+	fi
+	record "dry_run=FAIL reason=$preflight_error module_operations=no fuse_operations=no endpoint_execution=no"
+	snapshot dry-run-failure
+	printf '2\n' >"$evidence/dry-run-exit-status.txt"
+	return 2
+}
+
+verify_postboot() {
+	local dev
+	local status=0
+	[[ ${EUID} -eq 0 ]] || die 'must run as root'
+	[[ -s "$LATEST_RUN" ]] || die 'no recorded run exists'
+	evidence=$(<"$LATEST_RUN")
+	case "$evidence" in "$RUNS"/*) ;; *) die 'recorded run is outside runner evidence root' ;; esac
+	[[ -d "$evidence" ]] || die 'recorded evidence directory is absent'
+	record 'postboot_ssh=verified-by-successful-remote-postboot-command'
+	[[ $(hostnamectl --static 2>/dev/null || hostname) == "$EXPECTED_HOST" ]] || { record 'postboot_failed=unexpected-host'; status=1; }
+	[[ $(uname -r) == "$EXPECTED_KERNEL" ]] || { record 'postboot_failed=unexpected-kernel'; status=1; }
+	[[ $(sha256sum "$STOCK" | awk '{print $1}') == "$STOCK_HASH" ]] || { record 'postboot_failed=stock-hash-mismatch'; status=1; }
+	[[ $(modinfo -n hfi1) == "$STOCK" ]] || { record 'postboot_failed=stock-module-path-mismatch'; status=1; }
+	[[ $(cat /sys/module/hfi1/srcversion) == "$STOCK_SRCVERSION" ]] || { record 'postboot_failed=stock-srcversion-mismatch'; status=1; }
+	[[ $(cat /proc/sys/kernel/tainted) == 0 ]] || { record 'postboot_failed=kernel-tainted'; status=1; }
+	grep -q "^p:${KPROBE_GROUP}/" "$TRACE_ROOT/dynamic_events" 2>/dev/null && { record 'postboot_failed=kprobe-events-still-present'; status=1; }
+	systemctl is-active --quiet opa-fm || { record 'postboot_failed=opa-fm-not-active'; status=1; }
+	dev=$(find_active_hfi) || { record 'postboot_failed=stock-hfi-not-active-guid-driver-match'; status=1; }
+	if [[ $status -eq 0 ]]; then
+		record_hfi postboot "$dev"
+		record "postboot=PASS stock_hash=$STOCK_HASH hfi=$dev opa_fm=active taint=0 ssh=reachable"
+	fi
+	snapshot postboot
+	return "$status"
+}
+
+reset_fuse() {
+	local reason=$1
+	[[ ${EUID} -eq 0 ]] || die 'must run as root'
+	[[ -n "$reason" ]] || die '--reset-fuse requires a reason'
+	[[ -e "$FUSE" ]] || die 'fuse is not consumed'
+	install -d -o root -g root -m 0700 "$ROOT/fuse-history"
+	mv -- "$FUSE" "$ROOT/fuse-history/consumed-$(date -u +%Y%m%dT%H%M%SZ)"
+	{
+		printf 'reset_at='; date --iso-8601=seconds
+		printf 'reason=%s\n' "$reason"
+	} >>"$ROOT/fuse-history/reset.log"
+	printf 'fuse reset; reason=%s\n' "$reason" >&2
+}
+
+case ${1:-} in
+	--run) [[ $# -eq 1 ]] || die '--run accepts no additional arguments'; run_once ;;
+	--run-typefix)
+		[[ $# -eq 1 ]] || die '--run-typefix accepts no additional arguments'
+		module_mode=patched
+		run_once
+		;;
+	--run-typefix-noavx2-psm2)
+		[[ $# -eq 1 ]] || die '--run-typefix-noavx2-psm2 accepts no additional arguments'
+		module_mode=patched
+		psm_lib_mode=noavx2
+		run_once
+		;;
+	--run-typefix-distro-psm2)
+		[[ $# -eq 1 ]] || die '--run-typefix-distro-psm2 accepts no additional arguments'
+		module_mode=patched
+		psm_lib_mode=distro
+		run_once
+		;;
+	--dry-run) [[ $# -eq 1 ]] || die '--dry-run accepts no additional arguments'; dry_run ;;
+	--dry-run-typefix)
+		[[ $# -eq 1 ]] || die '--dry-run-typefix accepts no additional arguments'
+		module_mode=patched
+		dry_run
+		;;
+	--verify-postboot) verify_postboot ;;
+	--reset-fuse) [[ $# -eq 2 ]] || die '--reset-fuse requires exactly one reason argument'; reset_fuse "$2" ;;
+	*)
+		printf 'usage: %s --run | --run-typefix | --run-typefix-distro-psm2 | --run-typefix-noavx2-psm2 | --dry-run | --dry-run-typefix | --verify-postboot | --reset-fuse <reason>\n' "$0" >&2
+		exit 2
+		;;
+esac

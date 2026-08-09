@@ -1,0 +1,222 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: GPL-2.0-only
+# Single-use, T7610-only PSM2/HFI1 fault capture helper.
+# It is inert unless invoked as root with: --run -- /absolute/probe [args...]
+set -Eeuo pipefail
+
+readonly ROOT=/var/tmp/opa-psm2-fault-trace
+readonly RUNS="$ROOT/runs"
+readonly FUSE="$ROOT/RUN-ONCE-CONSUMED"
+readonly TRACE_ROOT=/sys/kernel/tracing
+readonly TRACE_NAME=psm2_hfi1_fault
+readonly WATCHDOG_SECONDS=120
+readonly WATCHDOG_KILL_AFTER_SECONDS=20
+
+trace_instance=
+run_dir=
+run_started=0
+
+die() {
+  printf '%s\n' "error: $*" >&2
+  exit 2
+}
+
+usage() {
+  cat <<'EOF'
+Usage:
+  sudo /var/tmp/opa-psm2-fault-trace/t7610-psm2-hfi1-fault-trace --run -- /absolute/probe [args ...]
+  sudo /var/tmp/opa-psm2-fault-trace/t7610-psm2-hfi1-fault-trace --recover [run-directory]
+
+--run is deliberately single-use. It records strace ioctl/mmap ordering, an HFI1
+function-trace instance, and kernel journal/dmesg/pstore snapshots. The probe is
+run as user "user" under a 120-second userland watchdog. This helper never
+reloads a driver, reboots, changes network configuration, or enables dynamic
+debug. It has no default probe; a source-instrumented, absolute executable path
+must be supplied explicitly after "--".
+
+If the host reboots before post-run collection, use --recover after logging in:
+  sudo /var/tmp/opa-psm2-fault-trace/t7610-psm2-hfi1-fault-trace --recover
+EOF
+}
+
+need_root() {
+  [[ ${EUID} -eq 0 ]] || die 'run this helper through sudo'
+}
+
+make_accessible() {
+  local path=$1
+  chown -R root:adm "$path" 2>/dev/null || true
+  chmod -R g+rX,o-rwx "$path" 2>/dev/null || true
+}
+
+snapshot_kernel() {
+  local label=$1
+  local out="$run_dir/$label"
+  mkdir -p "$out/pstore"
+  date --iso-8601=seconds >"$out/captured-at.txt"
+  dmesg -T >"$out/dmesg.txt" 2>&1 || true
+  journalctl -k -b --no-pager -o short-iso >"$out/journal-kernel-current-boot.txt" 2>&1 || true
+  journalctl -k -b -1 --no-pager -o short-iso >"$out/journal-kernel-previous-boot.txt" 2>&1 || true
+  find /sys/fs/pstore -maxdepth 1 -type f -printf '%f %s bytes\n' >"$out/pstore-index.txt" 2>&1 || true
+  find /sys/fs/pstore -maxdepth 1 -type f -exec cp -a -- {} "$out/pstore/" \; 2>/dev/null || true
+}
+
+write_metadata() {
+  {
+    printf 'captured_at='; date --iso-8601=seconds
+    printf 'hostname='; hostnamectl --static 2>/dev/null || hostname
+    printf 'kernel='; uname -r
+    printf 'strace='; strace --version 2>&1 | head -n 1
+    printf 'tracefs='; findmnt -T "$TRACE_ROOT" -n -o TARGET,SOURCE,FSTYPE,OPTIONS 2>&1 || true
+    printf 'probe_argv='
+    printf '%q ' "$@"
+    printf '\n'
+  } >"$run_dir/metadata.txt"
+  grep -E '(/hfi1/|hfi1[./])' /proc/dynamic_debug/control >"$run_dir/dynamic-debug-hfi1-before.txt" 2>&1 || true
+}
+
+prepare_ftrace() {
+  [[ -d "$TRACE_ROOT/instances" ]] || die "trace instances unavailable at $TRACE_ROOT/instances"
+  [[ -w "$TRACE_ROOT/instances" ]] || die "trace instances are not writable at $TRACE_ROOT/instances"
+  trace_instance="$TRACE_ROOT/instances/${TRACE_NAME}_$$"
+  mkdir "$trace_instance"
+  {
+    printf 'available_tracers: '; cat "$trace_instance/available_tracers"
+    printf 'initial_current_tracer: '; cat "$trace_instance/current_tracer"
+  } >"$run_dir/ftrace-instance-config-before.txt" 2>&1 || true
+  printf '0' >"$trace_instance/tracing_on"
+  printf 'nop' >"$trace_instance/current_tracer"
+  : >"$trace_instance/set_ftrace_filter"
+  printf '%s\n' \
+    hfi1_file_open \
+    hfi1_file_ioctl \
+    hfi1_file_mmap \
+    hfi1_file_close \
+    hfi1_create_ctxtdata \
+    hfi1_init_ctxt \
+    hfi1_free_ctxt \
+    hfi1_free_ctxtdata \
+    hfi1_mmu_rb_register \
+    hfi1_mmu_rb_insert \
+    hfi1_mmu_rb_release \
+    hfi1_mmu_rb_unregister \
+    >"$trace_instance/set_ftrace_filter"
+  printf 'function' >"$trace_instance/current_tracer"
+  printf '1' >"$trace_instance/tracing_on"
+}
+
+collect_ftrace() {
+  [[ -n "$trace_instance" && -d "$trace_instance" ]] || return 0
+  printf '0' >"$trace_instance/tracing_on" 2>/dev/null || true
+  cat "$trace_instance/trace" >"$run_dir/ftrace-hfi1-functions.txt" 2>&1 || true
+  cat "$trace_instance/set_ftrace_filter" >"$run_dir/ftrace-filter.txt" 2>&1 || true
+  rmdir "$trace_instance" 2>/dev/null || true
+  trace_instance=
+}
+
+finalize_run() {
+  local status=$?
+  set +e
+  if [[ $run_started -eq 1 && -n "$run_dir" ]]; then
+    collect_ftrace
+    snapshot_kernel post
+    printf '%s\n' "$status" >"$run_dir/runner-exit-status.txt"
+    date --iso-8601=seconds >"$run_dir/collection-finished-at.txt"
+    make_accessible "$run_dir"
+  fi
+  exit "$status"
+}
+
+claim_fuse() {
+  if ! ( set -o noclobber; : >"$FUSE" ) 2>/dev/null; then
+    die "single-use fuse already consumed: $FUSE (do not remove it without an explicit review)"
+  fi
+}
+
+latest_run() {
+  find "$RUNS" -mindepth 1 -maxdepth 1 -type d -printf '%T@ %p\n' \
+    | sort -nr | head -n 1 | cut -d' ' -f2-
+}
+
+recover() {
+  local target=${1:-}
+  if [[ -z "$target" ]]; then
+    target=$(latest_run)
+  fi
+  [[ -n "$target" && -d "$target" ]] || die 'no run directory exists to recover'
+  case "$(readlink -f "$target")" in
+    "$RUNS"/*) ;;
+    *) die "refusing recovery outside $RUNS" ;;
+  esac
+  run_dir=$(readlink -f "$target")
+  snapshot_kernel recovery-after-reboot
+  make_accessible "$run_dir"
+  printf '%s\n' "recovery evidence saved under $run_dir/recovery-after-reboot"
+}
+
+run_once() {
+  [[ $# -ge 1 ]] || die 'missing probe command after --'
+  local probe=$1
+  [[ "$probe" = /* ]] || die 'probe must be an absolute executable path'
+  [[ -f "$probe" && -x "$probe" ]] || die "probe is not an executable regular file: $probe"
+  command -v strace >/dev/null || die 'strace is required but unavailable'
+  command -v timeout >/dev/null || die 'timeout is required but unavailable'
+  command -v runuser >/dev/null || die 'runuser is required but unavailable'
+  [[ -d "$TRACE_ROOT" ]] || die "tracefs unavailable at $TRACE_ROOT"
+
+  install -d -o root -g adm -m 2750 "$ROOT" "$RUNS"
+  exec 9>"$ROOT/.runner.lock"
+  flock -n 9 || die 'another trace helper invocation is active'
+
+  # Validate first; only a probe that could actually run may consume the fuse.
+  id user >/dev/null || die 'required probe account "user" does not exist'
+  claim_fuse
+  {
+    printf 'claimed_at='; date --iso-8601=seconds
+    printf 'probe_argv='
+    printf '%q ' "$@"
+    printf '\n'
+  } >"$FUSE"
+  chmod 0640 "$FUSE"
+
+  run_dir=$(mktemp -d "$RUNS/$(date -u +%Y%m%dT%H%M%SZ)-XXXXXX")
+  chown root:adm "$run_dir"
+  chmod 2770 "$run_dir"
+  run_started=1
+  trap finalize_run EXIT
+  write_metadata "$@"
+  snapshot_kernel pre
+  prepare_ftrace
+
+  set +e
+  timeout --foreground --signal=TERM --kill-after="${WATCHDOG_KILL_AFTER_SECONDS}s" "${WATCHDOG_SECONDS}s" \
+    runuser -u user -- \
+      strace -ff -ttt -T -yy -s 512 -o "$run_dir/strace" \
+        -e trace=ioctl,mmap,munmap,mprotect,openat,close -- "$@" \
+      >"$run_dir/probe-stdout.txt" 2>"$run_dir/probe-stderr.txt"
+  local status=$?
+  set -e
+  printf '%s\n' "$status" >"$run_dir/probe-exit-status.txt"
+  exit "$status"
+}
+
+main() {
+  need_root
+  case ${1:-} in
+    --help|-h|'') usage ;;
+    --recover)
+      shift
+      [[ $# -le 1 ]] || die '--recover accepts at most one run directory'
+      recover "${1:-}"
+      ;;
+    --run)
+      shift
+      [[ ${1:-} == -- ]] || die '--run requires -- before the probe command'
+      shift
+      run_once "$@"
+      ;;
+    *) die "unknown argument: $1" ;;
+  esac
+}
+
+main "$@"

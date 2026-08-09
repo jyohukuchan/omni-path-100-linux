@@ -1,0 +1,29 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-2.0-only
+# Place hfi1/sdma interrupts on a chosen CPU list, saving the original set once.
+set -Eeuo pipefail
+SAVE=/var/tmp/hfi1-irq-affinity.orig
+irqs() { grep -E "hfi1_0|sdma[0-9]+" /proc/interrupts | awk -F: "{print \$1}" | tr -d " "; }
+case ${1:-} in
+  --save)
+    : >"$SAVE"; for i in $(irqs); do printf "%s %s\n" "$i" "$(cat /proc/irq/$i/smp_affinity_list)" >>"$SAVE"; done
+    echo "saved $(wc -l <"$SAVE") entries";;
+  --set)
+    list=${2:?cpu list, e.g. 24-31}
+    cpus=($(python3 -c "
+import sys
+out=[]
+for p in sys.argv[1].split(\",\"):
+    if \"-\" in p:
+        a,b=p.split(\"-\"); out+=list(range(int(a),int(b)+1))
+    else: out.append(int(p))
+print(\" \".join(map(str,out)))" "$list"))
+    n=0; for i in $(irqs); do echo "${cpus[$((n % ${#cpus[@]}))]}" | sudo tee /proc/irq/$i/smp_affinity_list >/dev/null || true; n=$((n+1)); done
+    echo "placed $n irqs on $list";;
+  --restore)
+    [[ -s "$SAVE" ]] || { echo "no saved affinities"; exit 1; }
+    while read -r i a; do echo "$a" > /proc/irq/$i/smp_affinity_list 2>/dev/null || true; done <"$SAVE"
+    echo "restored";;
+  --show) for i in $(irqs); do printf "%s %s\n" "$i" "$(cat /proc/irq/$i/effective_affinity_list)"; done | head -8;;
+  *) echo "usage: $0 --save | --set CPULIST | --restore | --show"; exit 2;;
+esac

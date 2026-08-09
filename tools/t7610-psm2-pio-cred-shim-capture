@@ -1,0 +1,265 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: GPL-2.0-only
+# One-use, root-only T7610 capture for the patched PIO_CRED HFI1 test.
+#
+# This is deliberately independent from both earlier capture namespaces.  It
+# creates a process-local sysfs alias only for its unprivileged child and
+# removes that alias during normal finalization or explicit post-boot recovery.
+set -Eeuo pipefail
+
+readonly ROOT=/var/tmp/opa-psm2-pio-cred-shim-capture
+readonly RUNS="$ROOT/runs"
+readonly FUSE="$ROOT/RUN-ONCE-CONSUMED"
+readonly SHIM_ROOT=/var/tmp/opa-psm2-pio-cred-shims
+readonly SHIM_TARGET=/sys/class/infiniband/opap129s0
+SHIM_TARGET_REAL=$(readlink -f "$SHIM_TARGET")
+readonly SHIM_TARGET_REAL
+readonly EXPECTED_GUID=0011750101088053
+readonly TRACE_ROOT=/sys/kernel/tracing
+readonly TRACE_NAME=psm2_hfi1_pio_cred_shim
+readonly WATCHDOG_SECONDS=120
+readonly WATCHDOG_KILL_AFTER_SECONDS=20
+
+trace_instance=
+run_dir=
+shim_dir=
+run_started=0
+
+die() {
+	printf 'error: %s\n' "$*" >&2
+	exit 2
+}
+
+usage() {
+	cat <<'EOF'
+Usage:
+  t7610-psm2-pio-cred-shim-capture --run -- /absolute/psm2_ep_open_probe
+  t7610-psm2-pio-cred-shim-capture --recover [run-directory]
+
+--run is one-use.  It claims its own fuse before launching the child, then
+captures HFI open/ioctl/mmap strace, isolated HFI ftrace, PSM trace stderr,
+and pre/post kernel journal, dmesg, and pstore snapshots.  The child runs as
+"user" under a 120-second watchdog with PSM2_HFI1_MAP_TRACE=1 and a private
+HFI_SYSFS_PATH hfi1_0 alias to the expected active HFI.  It does not change
+modules, services, networking, boot configuration, or either prior fuse.
+
+--recover only preserves a post-boot snapshot and removes a stale alias from
+this helper's own latest run.  It never changes a fuse or runs a probe.
+EOF
+}
+
+need_root() {
+	[[ ${EUID} -eq 0 ]] || die 'this helper must run as root'
+}
+
+snapshot_kernel() {
+	local label=$1
+	local out="$run_dir/$label"
+	mkdir -p "$out/pstore"
+	date --iso-8601=seconds >"$out/captured-at.txt"
+	dmesg -T >"$out/dmesg.txt" 2>&1 || true
+	journalctl -k -b --no-pager -o short-iso >"$out/journal-kernel-current-boot.txt" 2>&1 || true
+	journalctl -k -b -1 --no-pager -o short-iso >"$out/journal-kernel-previous-boot.txt" 2>&1 || true
+	find /sys/fs/pstore -maxdepth 1 -type f -printf '%f %s bytes\n' >"$out/pstore-index.txt" 2>&1 || true
+	find /sys/fs/pstore -maxdepth 1 -type f -exec cp -a -- {} "$out/pstore/" \; 2>/dev/null || true
+}
+
+write_metadata() {
+	{
+		printf 'captured_at='; date --iso-8601=seconds
+		printf 'hostname='; hostnamectl --static 2>/dev/null || hostname
+		printf 'kernel='; uname -r
+		printf 'runner_euid=%s\n' "$EUID"
+		printf 'psm2_hfi1_map_trace=1\n'
+		printf 'watchdog_seconds=%s\n' "$WATCHDOG_SECONDS"
+		printf 'shim_target=%s\n' "$SHIM_TARGET"
+		printf 'strace='; strace --version 2>&1 | head -n 1
+		printf 'tracefs='; findmnt -T "$TRACE_ROOT" -n -o TARGET,SOURCE,FSTYPE,OPTIONS 2>&1 || true
+		printf 'probe_argv='; printf '%q ' "$@"; printf '\n'
+	} >"$run_dir/metadata.txt"
+	grep -E '(/hfi1/|hfi1[./])' /proc/dynamic_debug/control >"$run_dir/dynamic-debug-hfi1-before.txt" 2>&1 || true
+}
+
+validate_shim_target() {
+	[[ -d "$SHIM_TARGET" ]] || die "expected shim target is absent: $SHIM_TARGET"
+	[[ $(readlink -f "$SHIM_TARGET/device/driver") == /sys/bus/pci/drivers/hfi1 ]] || die 'shim target is not driven by hfi1'
+	[[ $(tr -d ':' <"$SHIM_TARGET/node_guid") == "$EXPECTED_GUID" ]] || die 'shim target GUID does not match'
+	[[ $(<"$SHIM_TARGET/ports/1/state") == *ACTIVE* ]] || die 'shim target port is not ACTIVE'
+	[[ $(<"$SHIM_TARGET/ports/1/phys_state") == *LinkUp* ]] || die 'shim target physical state is not LinkUp'
+}
+
+prepare_shim() {
+	install -d -o root -g root -m 0711 "$SHIM_ROOT"
+	shim_dir=$(mktemp -d "$SHIM_ROOT/$(date -u +%Y%m%dT%H%M%SZ)-XXXXXX")
+	printf 'shim_dir=%s\n' "$shim_dir" >"$run_dir/shim.txt"
+	chown user:user "$shim_dir"
+	chmod 0700 "$shim_dir"
+	ln -s "$SHIM_TARGET" "$shim_dir/hfi1_0"
+	[[ $(stat -c '%U:%G:%a' "$shim_dir") == user:user:700 ]] || die 'shim ownership or mode check failed'
+	[[ $(readlink -f "$shim_dir/hfi1_0") == "$SHIM_TARGET_REAL" ]] || die 'shim target resolution check failed'
+	{
+		printf 'hfi_sysfs_path=%s/hfi1_0\n' "$shim_dir"
+		printf 'shim_dir_mode_owner='; stat -c '%U:%G:%a' "$shim_dir"
+		printf 'shim_alias_target_class=%s\n' "$SHIM_TARGET"
+		printf 'shim_alias_target_real='; readlink -f "$shim_dir/hfi1_0"
+	} >"$run_dir/shim.txt"
+}
+
+cleanup_shim() {
+	[[ -n "$shim_dir" ]] || return 0
+	case "$shim_dir" in
+		"$SHIM_ROOT"/*) ;;
+		*) die "refusing cleanup outside shim root: $shim_dir" ;;
+	esac
+	if [[ -L "$shim_dir/hfi1_0" ]]; then
+		[[ $(readlink -f "$shim_dir/hfi1_0") == "$SHIM_TARGET_REAL" ]] || die 'refusing cleanup of unexpected shim target'
+		rm -- "$shim_dir/hfi1_0"
+	fi
+	rmdir -- "$shim_dir" 2>/dev/null || true
+	printf 'shim_cleanup=attempted_at_%s\n' "$(date --iso-8601=seconds)" >>"$run_dir/shim.txt" 2>/dev/null || true
+	shim_dir=
+}
+
+prepare_ftrace() {
+	[[ -d "$TRACE_ROOT/instances" && -w "$TRACE_ROOT/instances" ]] || die "trace instances unavailable at $TRACE_ROOT/instances"
+	trace_instance="$TRACE_ROOT/instances/${TRACE_NAME}_$$"
+	mkdir "$trace_instance"
+	{
+		printf 'available_tracers: '; cat "$trace_instance/available_tracers"
+		printf 'initial_current_tracer: '; cat "$trace_instance/current_tracer"
+	} >"$run_dir/ftrace-instance-config-before.txt" 2>&1 || true
+	printf '0' >"$trace_instance/tracing_on"
+	printf 'nop' >"$trace_instance/current_tracer"
+	: >"$trace_instance/set_ftrace_filter"
+	printf '%s\n' \
+		hfi1_file_open \
+		hfi1_file_ioctl \
+		hfi1_file_mmap \
+		hfi1_file_close \
+		hfi1_create_ctxtdata \
+		hfi1_init_ctxt \
+		hfi1_free_ctxt \
+		hfi1_free_ctxtdata \
+		hfi1_mmu_rb_register \
+		hfi1_mmu_rb_insert \
+		hfi1_mmu_rb_release \
+		hfi1_mmu_rb_unregister \
+		>"$trace_instance/set_ftrace_filter"
+	printf 'function' >"$trace_instance/current_tracer"
+	printf '1' >"$trace_instance/tracing_on"
+}
+
+collect_ftrace() {
+	[[ -n "$trace_instance" && -d "$trace_instance" ]] || return 0
+	printf '0' >"$trace_instance/tracing_on" 2>/dev/null || true
+	cat "$trace_instance/trace" >"$run_dir/ftrace-hfi1-functions.txt" 2>&1 || true
+	cat "$trace_instance/set_ftrace_filter" >"$run_dir/ftrace-filter.txt" 2>&1 || true
+	rmdir "$trace_instance" 2>/dev/null || true
+	trace_instance=
+}
+
+finalize_run() {
+	local status=$?
+	set +e
+	if [[ $run_started -eq 1 && -n "$run_dir" ]]; then
+		collect_ftrace
+		cleanup_shim
+		snapshot_kernel post
+		printf '%s\n' "$status" >"$run_dir/runner-exit-status.txt"
+		date --iso-8601=seconds >"$run_dir/collection-finished-at.txt"
+		chmod -R go-rwx "$run_dir" 2>/dev/null || true
+	fi
+	exit "$status"
+}
+
+claim_fuse() {
+	if ! (set -o noclobber; : >"$FUSE") 2>/dev/null; then
+		die "single-use fuse already consumed: $FUSE (do not remove it)"
+	fi
+}
+
+latest_run() {
+	find "$RUNS" -mindepth 1 -maxdepth 1 -type d -printf '%T@ %p\n' | sort -nr | head -n 1 | cut -d' ' -f2-
+}
+
+recover() {
+	local target=${1:-}
+	[[ -n "$target" ]] || target=$(latest_run)
+	[[ -n "$target" && -d "$target" ]] || die 'no run directory exists to recover'
+	case "$(readlink -f "$target")" in
+		"$RUNS"/*) ;;
+		*) die "refusing recovery outside $RUNS" ;;
+	esac
+	run_dir=$(readlink -f "$target")
+	sha256sum "$0" >"$run_dir/recovery-helper.sha256"
+	shim_dir=$(awk -F= '$1 == "shim_dir" { print $2; exit }' "$run_dir/shim.txt" 2>/dev/null || true)
+	cleanup_shim
+	snapshot_kernel recovery-after-reboot
+	chmod -R go-rwx "$run_dir" 2>/dev/null || true
+	printf 'recovery_evidence=%s/recovery-after-reboot\n' "$run_dir"
+}
+
+run_once() {
+	[[ $# -eq 1 ]] || die 'exactly one absolute probe executable is required after --'
+	local probe=$1
+	[[ "$probe" = /* && -f "$probe" && -x "$probe" ]] || die 'probe must be an absolute executable regular file'
+	command -v strace >/dev/null || die 'strace is required but unavailable'
+	command -v timeout >/dev/null || die 'timeout is required but unavailable'
+	command -v setpriv >/dev/null || die 'setpriv is required but unavailable'
+	[[ -d "$TRACE_ROOT" ]] || die "tracefs unavailable at $TRACE_ROOT"
+	id user >/dev/null || die 'required probe account user does not exist'
+	validate_shim_target
+
+	install -d -o root -g root -m 0700 "$ROOT" "$RUNS"
+	exec 9>"$ROOT/.runner.lock"
+	flock -n 9 || die 'another shim capture invocation is active'
+	claim_fuse
+	{
+		printf 'claimed_at='; date --iso-8601=seconds
+		printf 'probe_argv='; printf '%q ' "$@"; printf '\n'
+	} >"$FUSE"
+	chmod 0600 "$FUSE"
+
+	run_dir=$(mktemp -d "$RUNS/$(date -u +%Y%m%dT%H%M%SZ)-XXXXXX")
+	chmod 0700 "$run_dir"
+	run_started=1
+	trap finalize_run EXIT
+	write_metadata "$@"
+	snapshot_kernel pre
+	prepare_shim
+	prepare_ftrace
+
+	set +e
+	timeout --foreground --signal=TERM --kill-after="${WATCHDOG_KILL_AFTER_SECONDS}s" "${WATCHDOG_SECONDS}s" \
+		strace -ff -ttt -T -yy -s 512 -o "$run_dir/strace" \
+		-e trace=ioctl,mmap,munmap,mprotect,openat,close -- \
+		setpriv --reuid=user --regid=user --init-groups \
+		env -u HFI_SYSFS_PATH PSM2_HFI1_MAP_TRACE=1 HFI_SYSFS_PATH="$shim_dir/hfi1_0" \
+		"$probe" \
+		>"$run_dir/probe-stdout.txt" 2>"$run_dir/probe-stderr.txt"
+	local status=$?
+	set -e
+	printf '%s\n' "$status" >"$run_dir/probe-exit-status.txt"
+	exit "$status"
+}
+
+main() {
+	need_root
+	case ${1:-} in
+		--help|-h|'') usage ;;
+		--recover)
+			shift
+			[[ $# -le 1 ]] || die '--recover accepts at most one run directory'
+			recover "${1:-}"
+			;;
+		--run)
+			shift
+			[[ ${1:-} == -- ]] || die '--run requires -- before the probe command'
+			shift
+			run_once "$@"
+			;;
+		*) die "unknown argument: $1" ;;
+	esac
+}
+
+main "$@"

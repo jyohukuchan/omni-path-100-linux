@@ -1,0 +1,236 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: GPL-2.0-only
+# T7610-only, one-shot activation/rollback runner for the reviewed PIO_CRED
+# HFI1 module.  It intentionally has no WRX80 address or remote endpoint.
+set -Eeuo pipefail
+
+readonly EXPECTED_HOST=t7610
+readonly EXPECTED_KERNEL=6.17.0-1030-oem
+readonly STOCK=/lib/modules/6.17.0-1030-oem/kernel/drivers/infiniband/hw/hfi1/hfi1.ko.zst
+readonly STOCK_HASH=8a64cd2ae769a2e26de0ebc3ab7622bb8f003bf4509c1c67054be2218398bff9
+readonly BUNDLE=/var/tmp/opa-hfi1-pio-cred-build-20260804T135917Z
+readonly PATCHED="$BUNDLE/source/drivers/infiniband/hw/hfi1/hfi1.ko"
+readonly PATCHED_HASH=11b369312fbe6b7c22a43e2aaec7616cb4fcd76d70d96a124cba7060c87dc2b0
+readonly PATCHED_SRCVERSION=B12ECD0EAFC9F54D1510975
+readonly EXPECTED_NODE_GUID=0011750101088053
+readonly PROBE=/var/tmp/opa-psm2-fault-trace/build-20260804T131836Z/bin/psm2_ep_open_probe
+readonly PSM_LIB=/var/tmp/opa-psm2-fault-trace/build-20260804T131836Z/lib/libpsm2.so.2
+readonly PRIOR_FUSE=/var/tmp/opa-psm2-fault-trace/RUN-ONCE-CONSUMED
+readonly CAPTURE=/var/tmp/opa-psm2-pio-cred-capture/t7610-psm2-pio-cred-capture
+readonly CAPTURE_FUSE=/var/tmp/opa-psm2-pio-cred-capture/RUN-ONCE-CONSUMED
+readonly HFI_DEV=/dev/hfi1_0
+
+evidence=
+changed=0
+
+die() {
+	printf 'ERROR: %s\n' "$*" >&2
+	exit 2
+}
+
+record() {
+	printf '%s %s\n' "$(date --iso-8601=seconds)" "$*" | tee -a "$evidence/activation.log"
+}
+
+snapshot() {
+	local label=$1
+	mkdir -p "$evidence/$label/pstore"
+	dmesg -T >"$evidence/$label/dmesg.txt" 2>&1 || true
+	journalctl -k -b --no-pager -o short-iso >"$evidence/$label/journal-kernel.txt" 2>&1 || true
+	find /sys/fs/pstore -maxdepth 1 -type f -printf '%f %s bytes\n' >"$evidence/$label/pstore-index.txt" 2>&1 || true
+	find /sys/fs/pstore -maxdepth 1 -type f -exec cp -a -- {} "$evidence/$label/pstore/" \; 2>/dev/null || true
+	{
+		uname -a
+		cat /proc/sys/kernel/tainted
+		lsmod
+		rdma link show
+		ibstat
+		systemctl status --no-pager -n 0 opa-fm
+	} >"$evidence/$label/runtime-status.txt" 2>&1 || true
+}
+
+fail_preflight() {
+	record "preflight_failed=$*"
+	snapshot preflight-failure
+	exit 2
+}
+
+abort_to_stock() {
+	local reason=$1
+	record "rollback_reboot_reason=$reason"
+	snapshot "failure-${reason//[^a-zA-Z0-9._-]/_}"
+	sync
+	# No module or boot files were replaced. A regular boot loads the packaged
+	# stock module selected by the unchanged OEM kernel entry.
+	systemctl reboot || /sbin/reboot
+	exit 1
+}
+
+require_active_port_and_fm() {
+	local i device
+	for ((i = 1; i <= 90; i++)); do
+		if device=$(find_active_hfi_rdma_device) \
+			&& systemctl is-active --quiet opa-fm; then
+			record_active_hfi_rdma_device post-load "$device"
+			record "port_and_opa_fm_active_after_seconds=$i device=$device"
+			return 0
+		fi
+		sleep 1
+	done
+	return 1
+}
+
+# A patched hfi1 build can register its CA as opap<PCI-function> rather than
+# the stock hfi1_0 name.  Treat the kernel association, stable GUID, and port
+# state as the identity; neither rename nor infer identity from the CA name.
+find_active_hfi_rdma_device() {
+	local class_path device driver node_guid port_state physical_state
+	for class_path in /sys/class/infiniband/*; do
+		[[ -e "$class_path" ]] || continue
+		device=${class_path##*/}
+		driver=$(readlink -f "$class_path/device/driver" 2>/dev/null || true)
+		[[ ${driver##*/} == hfi1 ]] || continue
+		node_guid=$(tr -d ':' <"$class_path/node_guid" 2>/dev/null || true)
+		[[ $node_guid == "$EXPECTED_NODE_GUID" ]] || continue
+		port_state=$(<"$class_path/ports/1/state")
+		physical_state=$(<"$class_path/ports/1/phys_state")
+		[[ $port_state == *ACTIVE* && $physical_state == *LinkUp* ]] || continue
+		printf '%s\n' "$device"
+		return 0
+	done
+	return 1
+}
+
+record_active_hfi_rdma_device() {
+	local label=$1 device=$2 class_path=/sys/class/infiniband/$2
+	{
+		printf 'rdma_device=%s\n' "$device"
+		printf 'driver='; readlink -f "$class_path/device/driver"
+		printf 'node_guid='; cat "$class_path/node_guid"
+		printf 'port_state='; cat "$class_path/ports/1/state"
+		printf 'physical_state='; cat "$class_path/ports/1/phys_state"
+	} >"$evidence/${label}-hfi-association.txt"
+	rdma link show >"$evidence/${label}-rdma-link.txt" 2>&1 || true
+	ibstat >"$evidence/${label}-ibstat.txt" 2>&1 || true
+}
+
+main() {
+	[[ ${EUID} -eq 0 ]] || die 'must run as root'
+	[[ $(hostnamectl --static 2>/dev/null || hostname) == "$EXPECTED_HOST" ]] || die 'refusing non-T7610 host'
+	[[ $(uname -r) == "$EXPECTED_KERNEL" ]] || die 'unexpected kernel'
+
+	evidence=$(mktemp -d /var/tmp/opa-hfi1-pio-cred-activation-$(date -u +%Y%m%dT%H%M%SZ)-XXXXXX)
+	chown root:root "$evidence"
+	chmod 0700 "$evidence"
+	record 'physical_recovery_assumption=explicitly authorized T7610 console/watchdog/physical recovery'
+	record 'scope=T7610 only; no WRX80 operation or remote PSM2 transport'
+	record "kernel=$(uname -r)"
+
+	[[ -r "$STOCK" && -r "$PATCHED" ]] || fail_preflight 'stock-or-patched-module-unreadable'
+	[[ $(modinfo -n hfi1) == "$STOCK" ]] || fail_preflight 'loaded-stock-path-mismatch'
+	[[ $(sha256sum "$STOCK" | awk '{print $1}') == "$STOCK_HASH" ]] || fail_preflight 'stock-hash-mismatch'
+	[[ $(sha256sum "$PATCHED" | awk '{print $1}') == "$PATCHED_HASH" ]] || fail_preflight 'patched-hash-mismatch'
+	[[ $(modinfo -F srcversion "$PATCHED") == "$PATCHED_SRCVERSION" ]] || fail_preflight 'patched-srcversion-mismatch'
+	stock_rel=${STOCK#/lib/modules/$(uname -r)/}
+	modinfo -F depends hfi1 >"$evidence/preflight-hfi1-modinfo-depends.txt"
+	hfi_depends=$(tr -d '\n' <"$evidence/preflight-hfi1-modinfo-depends.txt")
+	[[ -n "$hfi_depends" ]] || fail_preflight 'hfi1-has-no-declared-dependencies'
+	grep -F "${stock_rel}:" "/lib/modules/$(uname -r)/modules.dep" >"$evidence/preflight-hfi1-modules.dep.txt" || fail_preflight 'hfi1-missing-from-modules.dep'
+	grep -Fq 'rdmavt.ko' "$evidence/preflight-hfi1-modules.dep.txt" || fail_preflight 'hfi1-modules.dep-missing-rdmavt'
+	grep -qx 'SecureBoot disabled' < <(mokutil --sb-state) || fail_preflight 'secureboot-not-disabled'
+	! grep -qx 'CONFIG_MODULE_SIG_FORCE=y' "/boot/config-$(uname -r)" || fail_preflight 'module-signature-force-enabled'
+	[[ $(cat /proc/sys/kernel/tainted) == 0 ]] || fail_preflight 'kernel-already-tainted'
+	[[ -e "$PRIOR_FUSE" ]] || fail_preflight 'prior-capture-fuse-missing'
+	[[ ! -e "$CAPTURE_FUSE" ]] || fail_preflight 'new-capture-fuse-already-consumed'
+	[[ -x "$CAPTURE" && -x "$PROBE" && -r "$PSM_LIB" ]] || fail_preflight 'capture-or-psm-bundle-unavailable'
+	ldd "$PROBE" >"$evidence/psm-probe-ldd.txt"
+	actual_psm_lib=$(awk '$1 == "libpsm2.so.2" && $2 == "=>" { print $3; exit }' "$evidence/psm-probe-ldd.txt")
+	[[ -n "$actual_psm_lib" && $(readlink -f "$actual_psm_lib") == $(readlink -f "$PSM_LIB") ]] || fail_preflight 'psm-probe-resolves-unexpected-library'
+	printf 'psm2_linked_library=%s\npsm2_expected_library=%s\n' "$actual_psm_lib" "$PSM_LIB" >"$evidence/psm-probe-library-resolution.txt"
+	readelf -d "$PROBE" >"$evidence/psm-probe-readelf-dynamic.txt"
+	grep -Fq 'RUNPATH' "$evidence/psm-probe-readelf-dynamic.txt" || fail_preflight 'psm-probe-has-no-runpath'
+	preflight_hfi_device=$(find_active_hfi_rdma_device) || fail_preflight 'hfi-port-not-active-or-associated'
+	record_active_hfi_rdma_device preflight "$preflight_hfi_device"
+	record "preflight_hfi_device=$preflight_hfi_device"
+	systemctl is-active --quiet opa-fm || fail_preflight 'opa-fm-not-active'
+
+	fuser -u "$HFI_DEV" >"$evidence/preflight-fuser-users.txt" 2>&1 || fuser_status=$?
+	if [[ -s "$evidence/preflight-fuser-users.txt" ]]; then
+		fail_preflight 'hfi-device-has-user-process'
+	fi
+	lsof "$HFI_DEV" >"$evidence/preflight-lsof.txt" 2>&1 || lsof_status=$?
+	if [[ -s "$evidence/preflight-lsof.txt" ]]; then
+		fail_preflight 'hfi-device-has-open-file'
+	fi
+	ps -eo pid=,user=,comm=,args= | awk 'BEGIN { IGNORECASE=1 } $3 ~ /^(psm2.*|ib_(write|read|send|atomic).*|mpirun|mpiexec|osu_.*|imb.*)$/ { print }' >"$evidence/preflight-bench-processes.txt"
+	[[ ! -s "$evidence/preflight-bench-processes.txt" ]] || fail_preflight 'psm-or-benchmark-process-present'
+	ip -br link >"$evidence/preflight-ip-links.txt"
+	awk '$1 ~ /^ib/ && $2 != "DOWN" { print }' "$evidence/preflight-ip-links.txt" >"$evidence/preflight-active-ib-links.txt"
+	[[ ! -s "$evidence/preflight-active-ib-links.txt" ]] || fail_preflight 'ipoib-link-not-down'
+	snapshot preflight-pass
+	record 'preflight=PASS'
+
+	# opa-fm is the only running HFI-specific service. rdma-ndd is not a
+	# device-file consumer and is left running; no broad RDMA service stop is
+	# permitted by this constrained activation.
+	systemctl stop opa-fm || abort_to_stock 'opa-fm-stop-failed'
+	changed=1
+	record 'stopped_service=opa-fm.service'
+	systemctl is-active --quiet opa-fm && abort_to_stock 'opa-fm-still-active'
+	fuser -u "$HFI_DEV" >"$evidence/post-stop-fuser-users.txt" 2>&1 || true
+	[[ ! -s "$evidence/post-stop-fuser-users.txt" ]] || abort_to_stock 'hfi-user-consumer-after-stop'
+
+	if grep -q '^ib_ipoib ' /proc/modules; then
+		modprobe -r ib_ipoib || abort_to_stock 'ipoib-unload-failed'
+		record 'unloaded_module=ib_ipoib'
+	fi
+	modprobe -r hfi1 || abort_to_stock 'hfi1-unload-failed'
+	grep -q '^hfi1 ' /proc/modules && abort_to_stock 'hfi1-remains-loaded'
+	record 'unloaded_module=hfi1'
+
+	# insmod deliberately does not resolve dependencies.  Reload only hfi1's
+	# declared direct requirements; modprobe resolves any narrow transitives
+	# such as rdmavt's ib_uverbs dependency without manually changing the wider
+	# RDMA stack.
+	for dependency in ${hfi_depends//,/ }; do
+		[[ -n "$dependency" && "$dependency" != hfi1 ]] || continue
+		modprobe "$dependency" || abort_to_stock "hfi1-dependency-load-failed-${dependency}"
+		record "loaded_hfi1_declared_dependency=$dependency"
+	done
+	grep '^rdmavt ' /proc/modules >"$evidence/pre-insmod-rdmavt-module.txt" || abort_to_stock 'rdmavt-provider-not-loaded'
+	grep -E '[[:space:]](rvt_register_device|ib_rvt_state_ops)[[:space:]].*\[rdmavt\]$' /proc/kallsyms >"$evidence/pre-insmod-rdmavt-provider-symbols.txt" || abort_to_stock 'rdmavt-provider-symbols-missing'
+	grep -q 'rvt_register_device' "$evidence/pre-insmod-rdmavt-provider-symbols.txt" || abort_to_stock 'rdmavt-register-provider-missing'
+	grep -q 'ib_rvt_state_ops' "$evidence/pre-insmod-rdmavt-provider-symbols.txt" || abort_to_stock 'rdmavt-state-provider-missing'
+	record 'rdmavt_provider=loaded-and-exporting-required-symbols'
+
+	insmod "$PATCHED" || abort_to_stock 'patched-hfi1-insert-failed'
+	grep -q '^hfi1 ' /proc/modules || abort_to_stock 'patched-hfi1-not-loaded'
+	[[ $(cat /sys/module/hfi1/srcversion) == "$PATCHED_SRCVERSION" ]] || abort_to_stock 'patched-hfi1-srcversion-not-loaded'
+	record "loaded_module=patched-hfi1 sha256=$PATCHED_HASH srcversion=$PATCHED_SRCVERSION"
+	snapshot patched-module-loaded
+
+	systemctl start opa-fm || abort_to_stock 'opa-fm-start-failed'
+	record 'started_service=opa-fm.service'
+	require_active_port_and_fm || abort_to_stock 'hfi-port-or-opa-fm-recovery-failed'
+	since_epoch=$(( $(date +%s) - 180 ))
+	journalctl -k -b --since "@$since_epoch" --no-pager -o short-iso >"$evidence/post-load-kernel-window.txt" 2>&1 || true
+	if grep -Eiq 'AER:|PCIe Bus Error|Bad pagetable|Corrupted page table|kernel BUG|Oops:' "$evidence/post-load-kernel-window.txt"; then
+		abort_to_stock 'unexpected-kernel-or-aer-error-after-load'
+	fi
+	[[ ! -e "$CAPTURE_FUSE" ]] || abort_to_stock 'new-capture-fuse-already-consumed-before-probe'
+	record 'patched-module-port-recovery=PASS'
+
+	set +e
+	"$CAPTURE" --run -- "$PROBE"
+	endpoint_status=$?
+	set -e
+	record "endpoint_probe_status=$endpoint_status"
+	find /var/tmp/opa-psm2-pio-cred-capture/runs -mindepth 1 -maxdepth 1 -type d -printf '%T@ %p\n' \
+		| sort -nr | head -n 1 | cut -d' ' -f2- >"$evidence/endpoint-capture-path.txt" || true
+	snapshot endpoint-finished
+	record 'rollback=normal-reboot-to-unchanged-stock-oem-module'
+	sync
+	systemctl reboot || /sbin/reboot
+}
+
+main "$@"

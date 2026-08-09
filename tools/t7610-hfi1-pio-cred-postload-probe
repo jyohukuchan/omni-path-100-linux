@@ -1,0 +1,68 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: GPL-2.0-only
+# Continue the already-loaded T7610 PIO_CRED experiment after an identity-only
+# RDMA device-name difference. This script never loads, unloads, or reloads a
+# module. It verifies the active HFI by module identity and GUID, runs the
+# new single-use capture once, and normally reboots to the unchanged stock boot.
+set -Eeuo pipefail
+
+readonly EXPECTED_KERNEL=6.17.0-1030-oem
+readonly PATCHED_SRCVERSION=B12ECD0EAFC9F54D1510975
+readonly EXPECTED_GUID=0011750101088053
+readonly PROBE=/var/tmp/opa-psm2-fault-trace/build-20260804T131836Z/bin/psm2_ep_open_probe
+readonly CAPTURE=/var/tmp/opa-psm2-pio-cred-capture/t7610-psm2-pio-cred-capture
+readonly CAPTURE_FUSE=/var/tmp/opa-psm2-pio-cred-capture/RUN-ONCE-CONSUMED
+
+evidence=${1:?usage: postload-probe EXISTING-ACTIVATION-EVIDENCE-DIRECTORY}
+
+record() {
+	printf '%s %s\n' "$(date --iso-8601=seconds)" "$*" | tee -a "$evidence/postload-continuation.log"
+}
+
+snapshot() {
+	local label=$1
+	mkdir -p "$evidence/$label/pstore"
+	dmesg -T >"$evidence/$label/dmesg.txt" 2>&1 || true
+	journalctl -k -b --no-pager -o short-iso >"$evidence/$label/journal-kernel.txt" 2>&1 || true
+	find /sys/fs/pstore -maxdepth 1 -type f -printf '%f %s bytes\n' >"$evidence/$label/pstore-index.txt" 2>&1 || true
+	find /sys/fs/pstore -maxdepth 1 -type f -exec cp -a -- {} "$evidence/$label/pstore/" \; 2>/dev/null || true
+}
+
+reboot_stock() {
+	local reason=$1
+	record "rollback=normal-reboot-to-stock reason=$reason"
+	snapshot "before-reboot-${reason//[^a-zA-Z0-9._-]/_}"
+	sync
+	systemctl reboot || /sbin/reboot
+}
+
+main() {
+	[[ ${EUID} -eq 0 ]] || { echo 'must run as root' >&2; exit 2; }
+	[[ -d "$evidence" && -w "$evidence" ]] || { echo 'invalid evidence directory' >&2; exit 2; }
+	[[ $(uname -r) == "$EXPECTED_KERNEL" ]] || reboot_stock 'unexpected-kernel'
+	[[ $(cat /sys/module/hfi1/srcversion) == "$PATCHED_SRCVERSION" ]] || reboot_stock 'patched-module-not-loaded'
+	[[ ! -e "$CAPTURE_FUSE" && -x "$CAPTURE" && -x "$PROBE" ]] || reboot_stock 'capture-not-available-or-already-used'
+
+	rdma link show >"$evidence/postload-rdma-link-generic.txt" 2>&1
+	ibstat >"$evidence/postload-ibstat-generic.txt" 2>&1
+	grep -q 'state ACTIVE .*physical_state LINK_UP' "$evidence/postload-rdma-link-generic.txt" || reboot_stock 'no-active-rdma-link'
+	grep -Fq "Node GUID: 0x$EXPECTED_GUID" "$evidence/postload-ibstat-generic.txt" || reboot_stock 'unexpected-active-hfi-guid'
+	systemctl is-active --quiet opa-fm || reboot_stock 'opa-fm-not-active'
+	since_epoch=$(( $(date +%s) - 300 ))
+	journalctl -k -b --since "@$since_epoch" --no-pager -o short-iso >"$evidence/postload-kernel-window-generic.txt" 2>&1 || true
+	if grep -Eiq 'AER:|PCIe Bus Error|Bad pagetable|Corrupted page table|kernel BUG|Oops:' "$evidence/postload-kernel-window-generic.txt"; then
+		reboot_stock 'unexpected-kernel-or-aer-error-before-probe'
+	fi
+	record 'postload_gate=PASS module=patched hfi=ACTIVE guid=expected opa-fm=active'
+
+	set +e
+	"$CAPTURE" --run -- "$PROBE"
+	endpoint_status=$?
+	set -e
+	record "endpoint_probe_status=$endpoint_status"
+	find /var/tmp/opa-psm2-pio-cred-capture/runs -mindepth 1 -maxdepth 1 -type d -printf '%T@ %p\n' \
+		| sort -nr | head -n 1 | cut -d' ' -f2- >"$evidence/endpoint-capture-path.txt" || true
+	reboot_stock 'endpoint-finished'
+}
+
+main "$@"

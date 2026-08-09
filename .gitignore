@@ -1,0 +1,14 @@
+# Third-party source clones kept only as a local, read-only reference.
+# They are large (several GiB) and carry their own licences; fetch them
+# yourself using the pinned inventory in docs/reference-sources.md instead.
+/reference/
+
+# Build and run artefacts
+*.o
+*.ko
+*.mod
+*.mod.c
+*.cmd
+.tmp_versions/
+Module.symvers
+modules.order

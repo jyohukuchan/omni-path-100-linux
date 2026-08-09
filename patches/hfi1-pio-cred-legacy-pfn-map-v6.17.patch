@@ -1,0 +1,64 @@
+From e5f0a698b34ed76002dc5cff3804a61c80233a7a Mon Sep 17 00:00:00 2001
+Subject: [PATCH] IB/hfi1: map PIO credit return through the legacy PFN path
+
+Experimental T7610-only repair candidate for the reproducible first read of
+the PIO-credit (mmap type 3) mapping corrupting the page table.
+
+The observed PSM2 request is a successful, shared, locked, 4 KiB read-only
+mapping for a type-3 token, followed by an Oops on its first load.  Type 3
+first switched to dma_mmap_coherent() in upstream commit
+1ec82317a1da ("IB/hfi1: Use dma_mmap_coherent for matching buffers").  The
+Cornelis OPXS 10.11.0.1 driver retains the older, direct PFN map for this
+specific credit-return page.
+
+Restore that established type-3 path only: calculate the physical page from
+the coherent allocation, select io_remap_pfn_range(), and leave all other
+DMA-backed mapping types on dma_mmap_coherent().  This is intentionally not
+a general reversion of 1ec82317a1da and does not alter user ABI tokens,
+lengths, permissions, allocation, or HFI credit-return DMA programming.
+
+It is a candidate rather than an accepted upstream fix: apply only to an
+exactly matched, recoverable T7610 kernel source tree after the trace patch
+has confirmed the type-3 mapping path and before one supervised repro.
+
+---
+diff --git a/drivers/infiniband/hw/hfi1/file_ops.c b/drivers/infiniband/hw/hfi1/file_ops.c
+index 503abec..b9b2095 100644
+--- a/drivers/infiniband/hw/hfi1/file_ops.c
++++ b/drivers/infiniband/hw/hfi1/file_ops.c
+@@ -370,8 +370,7 @@ static int hfi1_file_mmap(struct file *fp, struct vm_area_struct *vma)
+ 		vma->vm_page_prot = pgprot_writecombine(vma->vm_page_prot);
+ 		mapio = 1;
+ 		break;
+-	case PIO_CRED: {
+-		u64 cr_page_offset;
++	case PIO_CRED:
+ 		if (flags & VM_WRITE) {
+ 			ret = -EPERM;
+ 			goto done;
+@@ -381,11 +380,10 @@ static int hfi1_file_mmap(struct file *fp, struct vm_area_struct *vma)
+ 		 * second or third page allocated for credit returns (if number
+ 		 * of enabled contexts > 64 and 128 respectively).
+ 		 */
+-		cr_page_offset = ((u64)uctxt->sc->hw_free -
+-			  	     (u64)dd->cr_base[uctxt->numa_id].va) &
+-				   PAGE_MASK;
+-		memvirt = dd->cr_base[uctxt->numa_id].va + cr_page_offset;
+-		memdma = dd->cr_base[uctxt->numa_id].dma + cr_page_offset;
++		memvirt = dd->cr_base[uctxt->numa_id].va;
++		memaddr = virt_to_phys(memvirt) +
++			(((u64)uctxt->sc->hw_free -
++			  (u64)dd->cr_base[uctxt->numa_id].va) & PAGE_MASK);
+ 		memlen = PAGE_SIZE;
+ 		flags &= ~VM_MAYWRITE;
+ 		flags |= VM_DONTCOPY | VM_DONTEXPAND;
+@@ -395,8 +393,8 @@ static int hfi1_file_mmap(struct file *fp, struct vm_area_struct *vma)
+ 		 * memory been flagged as non-cached?
+ 		 */
+ 		/* vma->vm_page_prot = pgprot_noncached(vma->vm_page_prot); */
++		mapio = 1;
+ 		break;
+-	}
+ 	case RCV_HDRQ:
+ 		memlen = rcvhdrq_size(uctxt);
+ 		memvirt = uctxt->rcvhdrq;

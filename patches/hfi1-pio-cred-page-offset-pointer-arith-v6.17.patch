@@ -1,0 +1,62 @@
+IB/hfi1: fix PIO_CRED mmap using pointer arithmetic for a byte offset
+
+Prepared against Linux v6.17 (e5f0a698b34ed76002dc5cff3804a61c80233a7a).
+
+hfi1_file_mmap()'s PIO_CRED case computes cr_page_offset as a *byte*
+offset (0, PAGE_SIZE or 2 * PAGE_SIZE) and then adds it to
+dd->cr_base[].va, which is a `struct credit_return *`.  That is pointer
+arithmetic, so the offset is scaled by sizeof(struct credit_return) == 64
+and memvirt lands 64x too far - 256 KiB or 512 KiB past a 10240-byte
+allocation.
+
+memdma is unaffected: dma_addr_t is an integer type, so that line already
+does byte arithmetic.
+
+Consequences on a host whose user context has its credit-return entry on
+the second or third credit-return page (hardware send context index >= 64,
+which varies per boot):
+
+  - dma_mmap_coherent() -> iommu_dma_mmap() is called with a cpu_addr that
+    is inside the vmalloc range but belongs to no vm_area;
+  - dma_common_find_pages() returns NULL, so the vm_map_pages() fast path
+    is skipped;
+  - vmalloc_to_pfn() -> vmalloc_to_page() returns NULL and page_to_pfn(NULL)
+    yields (0 - vmemmap_base) / sizeof(struct page), a frame far above
+    MAXPHYADDR;
+  - remap_pfn_range() installs that frame, and the first user read of the
+    credit-return page takes "Corrupted page table" / "Oops: Bad pagetable"
+    with a reserved-bit fault.
+
+Measured on a Dell T7610 (46-bit MAXPHYADDR, Intel IOMMU in DMA-FQ mode,
+kernel 6.17.0-1030-oem) with kprobes on the mapping path:
+
+  iommu_dma_mmap        cpu_addr=0xffffd3b88ef11000 dma_addr=0xffece000 size=0x1000
+                        vmemmap_base=0xfffff71f00000000
+  dma_common_find_pages ret=0x0
+  vmalloc_to_pfn        ret=152538447872 (0x2384000000)
+  remap_pfn_range       pfn=0x2384000000
+  -> psm2_ep_open_pr: Corrupted page table at address ...
+     PGD ... PTE 800049168e911235 / Oops: Bad pagetable: 000d
+
+(0 - 0xfffff71f00000000) / 64 == 0x2384000000 exactly, confirming the
+page_to_pfn(NULL) origin of the frame.
+
+When the entry happens to be on the first page cr_page_offset is 0, the
+scaling is a no-op and the mapping succeeds, which is why the failure is
+intermittent across boots.
+
+Introduced by commit 1ec82317a1da, which converted this case from
+"virt_to_phys(va) + byte_offset" (integer arithmetic, correct) to the
+memvirt/memdma form without casting away the pointer type.
+
+--- a/drivers/infiniband/hw/hfi1/file_ops.c
++++ b/drivers/infiniband/hw/hfi1/file_ops.c
+@@ -384,7 +384,7 @@ static int hfi1_file_mmap(struct file *fp, struct vm_area_struct *vma)
+ 		cr_page_offset = ((u64)uctxt->sc->hw_free -
+ 			  	     (u64)dd->cr_base[uctxt->numa_id].va) &
+ 				   PAGE_MASK;
+-		memvirt = dd->cr_base[uctxt->numa_id].va + cr_page_offset;
++		memvirt = (u8 *)dd->cr_base[uctxt->numa_id].va + cr_page_offset;
+ 		memdma = dd->cr_base[uctxt->numa_id].dma + cr_page_offset;
+ 		memlen = PAGE_SIZE;
+ 		flags &= ~VM_MAYWRITE;

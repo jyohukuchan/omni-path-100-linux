@@ -1,0 +1,59 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: GPL-2.0-only
+# Sweep PSM2 bandwidth between the two hosts and print a table.
+#
+# Runs tools/mpi_bw.c (installed as /usr/local/bin/mpi_bw on both hosts) over
+# the OpenMPI PSM2 MTL.  Every pair is cross-host by construction: mpi_bw
+# derives the pairing from MPI_Get_processor_name, so a rank is never paired
+# with a rank on its own host.  Each run keeps the transferred volume roughly
+# constant so durations stay comparable.
+#
+# Keep TARGET_GIB large.  Short runs (a few seconds) are dominated by start-up
+# and ramp effects and swing by tens of Gb/s; at ~165 GiB per run the same
+# configuration repeats to within a fraction of a percent.
+set -Eeuo pipefail
+
+readonly PEER_IP=${PEER_IP:-192.168.0.148}
+readonly SELF_IP=${SELF_IP:-192.168.0.66}
+readonly RSH=${RSH:-"ssh -l user -o BatchMode=yes"}
+readonly BENCH=/usr/local/bin/mpi_bw
+readonly WRAP=/usr/local/bin/hfi_local_run
+readonly TARGET_GIB=${TARGET_GIB:-165}
+readonly REPS=${REPS:-3}
+readonly WINDOW=${WINDOW:-8}
+readonly RUN_TIMEOUT=${RUN_TIMEOUT:-300}
+
+hostfile=$(mktemp)
+trap 'rm -f "$hostfile"' EXIT
+printf '%s slots=32\n%s slots=32\n' "$PEER_IP" "$SELF_IP" >"$hostfile"
+
+# $1 pairs, $2 message bytes, $3 flip (0: local host sends, 1: peer sends)
+one_run() {
+	local pairs=$1 bytes=$2 flip=$3 rounds
+	rounds=$(( (TARGET_GIB * 1024 * 1024 * 1024) / (bytes * WINDOW * pairs) ))
+	[[ $rounds -lt 5 ]] && rounds=5
+	timeout "$RUN_TIMEOUT" mpirun --hostfile "$hostfile" -np $((pairs * 2)) \
+		--map-by "ppr:$pairs:node" --mca plm_rsh_agent "$RSH" \
+		--mca pml cm --mca mtl psm2 --bind-to none \
+		${PSM2_ENV:+$PSM2_ENV} \
+		"$WRAP" "$BENCH" "$bytes" "$WINDOW" "$rounds" "$flip" 2>&1 |
+		grep -oE 'aggregate=[0-9.]+' | cut -d= -f2
+}
+
+printf '%-6s %-10s %-16s %s\n' pairs msg_MiB direction 'Gb/s (per run)'
+for flip in 0 1; do
+	case $flip in
+		0) label='WRX80->T7610' ;;
+		1) label='T7610->WRX80' ;;
+	esac
+	for pairs in ${PAIRS:-1 2 4 8}; do
+		for mib in ${SIZES_MIB:-8 32}; do
+			results=()
+			for ((r = 0; r < REPS; r++)); do
+				v=$(one_run "$pairs" $((mib * 1024 * 1024)) "$flip" || true)
+				results+=("${v:-FAIL}")
+			done
+			printf '%-6s %-10s %-16s %s\n' "$pairs" "$mib" "$label" "${results[*]}"
+		done
+	done
+done
