@@ -183,16 +183,134 @@ cores execute more slowly.  The engine skew and interrupt rate are measured
 contributors; since rearranging QPs, processes, cores and SLs never lifted the
 plateau, the skew alone is not proven to be the single binding constraint.
 
+## Latency
+
+`tools/mpi_lat.c` is a two-host ping-pong reporting half round-trip time, with
+per-iteration samples so the distribution is visible.  `MPI_Wtime()` costs tens
+of nanoseconds, which is a few percent at the 1 us end and negligible above it.
+
+### PSM2, default configuration
+
+5000 iterations per size, one rank per host.
+
+| bytes | min | median | p99 | mean |
+| --- | --- | --- | --- | --- |
+| 8 | **1.02** | 1.31 | 1.68 | 1.35 us |
+| 64 | 1.27 | 1.41 | 1.88 | 1.45 |
+| 512 | 1.37 | 1.45 | 1.96 | 1.51 |
+| 4096 | 2.15 | 2.53 | 5.72 | 2.57 |
+| 16384 | 4.80 | 5.49 | 9.33 | 5.83 |
+| 32768 | 6.33 | 8.13 | 11.67 | 7.89 |
+| 63000 | 21.50 | 22.48 | 29.63 | 23.27 |
+| 65536 | 30.54 | 38.70 | 50.51 | 40.19 |
+| 131072 | 42.20 | 51.15 | 63.73 | 53.91 |
+| 262144 | 70.64 | 83.62 | 94.86 | 83.15 |
+| 1048576 | 233.32 | 284.14 | 298.58 | 280.90 |
+| 4194304 | 838.69 | 894.06 | 920.00 | 894.57 |
+
+The step between 63000 and 65536 bytes is PSM2 switching from eager to
+rendezvous at `PSM2_MQ_RNDV_HFI_THRESH`, whose default on Xeon is 64000
+(`MQ_HFI_THRESH_RNDV_XEON` in `psm_config.h`).
+
+## Eager versus TID (expected receive)
+
+Rendezvous uses the HFI's expected-receive mechanism: the receiver registers the
+destination buffer and hands back TIDs, and the payload is then DMA'd straight
+into it.  Eager instead lands the data in a shared receive buffer that the CPU
+copies out.  Moving the threshold lets both paths be measured at the *same*
+message size, which is the only way to separate the protocol from the size.
+
+### PSM2, same size, path forced with `PSM2_MQ_RNDV_HFI_THRESH`
+
+Median half round-trip, 3000 iterations:
+
+| bytes | eager | rendezvous / TID | TID cost |
+| --- | --- | --- | --- |
+| 4096 | 2.54 | 2.55 | none observed |
+| 16384 | 5.53 | 18.90 | +13.4 us |
+| 32768 | 8.09 | 25.34 | +17.3 us |
+| 65536 | 23.01 | 37.75 | +14.7 us |
+| 131072 | 33.80 | 48.88 | +15.1 us |
+| 262144 | 57.50 | 78.02 | +20.5 us |
+| 1048576 | 205.81 | 236.36 | +30.6 us |
+
+**Eager is faster at every size measured**, by a roughly constant 13-20 us —
+the rendezvous handshake — which simply matters proportionally less as the
+message grows.  At 4 KiB no difference appeared even with the threshold forced
+down, which is not explained here.
+
+So why does PSM2 switch to rendezvous at 64 KB?  Because latency is not what it
+is optimising.  The same 8 MiB, 4-pair bandwidth run:
+
+| path | bandwidth |
+| --- | --- |
+| rendezvous / TID (default) | 95.03, 94.87 Gb/s |
+| forced eager | 69.73, 69.51 Gb/s |
+
+TID buys **36% more bandwidth for 15-30 us of latency**.  For a latency-bound
+exchange of medium messages, raising `PSM2_MQ_RNDV_HFI_THRESH` is a real
+optimisation; for streaming, it costs a third of the link.
+
+### Verbs, TID RDMA off versus on
+
+`ib_write_lat`, 20000 iterations, `t_typical`:
+
+| bytes | TID RDMA off | TID RDMA on | change |
+| --- | --- | --- | --- |
+| 65536 | 25.76 | 25.93 | none — TID RDMA cannot engage |
+| 262144 | 99.13 | 168.79 | +70% |
+| 1048576 | 480.56 | 609.84 | +27% |
+
+The 64 KiB row is a check on the mechanism rather than a result:
+`TID_RDMA_MIN_SEGMENT_SIZE` is 256 KiB (`tid_rdma.h`), so TID RDMA is not
+available below that, and the measurement agrees.
+
+Small-message Verbs write latency, for reference (TID RDMA cannot engage at
+these sizes):
+
+| bytes | t_min | t_typical |
+| --- | --- | --- |
+| 8 | 4.29 | 5.96 us |
+| 512 | 6.02 | 7.21 |
+| 4096 | 7.72 | 8.17 |
+
+PSM2 is four to six times faster than kernel Verbs for small messages — 1.31 us
+against 5.96 us at 8 bytes — which is the usual reason MPI runs on PSM2 rather
+than on Verbs.
+
+### Summary
+
+TID / expected receive is a bandwidth optimisation that costs latency, in both
+stacks and by similar proportions:
+
+| | latency | bandwidth |
+| --- | --- | --- |
+| PSM2 rendezvous vs eager | +13 to +31 us | +36% |
+| Verbs TID RDMA vs plain RC | +27% to +70% | +43% to +49% |
+
+Neither default is wrong; they are tuned for streaming.  A latency-sensitive
+workload with medium messages should consider raising
+`PSM2_MQ_RNDV_HFI_THRESH`, and one that never sends more than 256 KiB gains
+nothing from TID RDMA either way.
+
 ## Reproducing
 
 ```bash
-# PSM2
+# PSM2 bandwidth
 tools/psm2-bw-sweep                       # defaults: 165 GiB/run, 3 reps
 PAIRS="4 8" SIZES_MIB=8 REPS=3 tools/psm2-bw-sweep
 
 # Verbs, 8 QPs, data flowing towards the server
 ib_write_bw -d hfi1_0 -i 1 -s 8388608 -q 8 -F --report_gbits -D 20          # server
 ib_write_bw -d hfi1_0 -i 1 -s 8388608 -q 8 -F --report_gbits -D 20 <server> # client
+```
+
+```bash
+# Latency, and the eager/TID comparison
+mpirun --hostfile hf -np 2 --map-by ppr:1:node --mca pml cm --mca mtl psm2 \
+       --bind-to none hfi_local_run mpi_lat 5000
+mpirun ... -x PSM2_MQ_RNDV_HFI_THRESH=8388608 hfi_local_run mpi_lat 3000 65536   # eager
+mpirun ... -x PSM2_MQ_RNDV_HFI_THRESH=8       hfi_local_run mpi_lat 3000 65536   # TID
 ```
 
 `tools/psm2-bw-sweep` has the host addresses at the top; adjust `PEER_IP` and

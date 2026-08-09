@@ -17,6 +17,17 @@ Measured between a Threadripper PRO 3995WX and a 2013 Dell Precision T7610:
 and packet headers are accounted for.  Before this work, PSM2 crashed the kernel
 and Verbs managed 50 Gb/s on the same path.
 
+Latency, half round-trip, same pair of hosts:
+
+| | 8 B | 64 KiB | 1 MiB |
+| --- | --- | --- | --- |
+| PSM2 (MPI) | **1.31 us** | 23.0 us eager / 37.8 us TID | 206 us eager / 236 us TID |
+| Verbs RDMA Write | 5.96 us | 25.9 us | 610 us TID / 481 us plain |
+
+TID / expected receive turns out to be a **bandwidth optimisation that costs
+latency**: measured at identical message sizes it adds 13-31 us in PSM2 and
+27-70% in Verbs, and buys 36-49% more bandwidth.
+
 Full numbers, including everything that turned out **not** to matter:
 [docs/benchmarks.md](docs/benchmarks.md).
 
@@ -98,6 +109,7 @@ hfi1 interrupt placement made no measurable difference.
 | `hfi1-typefix-activate` | load, restore, rehearse or persistently install the patched `hfi1`, with hash and ABI checks |
 | `hfi_local_run` | pin an MPI rank to its own HFI-local physical core |
 | `mpi_bw.c` | two-host streaming bandwidth benchmark; pairs are derived from processor names so they are never co-located |
+| `mpi_lat.c` | two-host ping-pong latency, reporting min/median/p99 per size |
 | `psm2-bw-sweep` | run the benchmark matrix and print every repetition |
 | `hfi1-irq-place` | move hfi1/sdma interrupts to a chosen CPU list, with save and restore |
 | `cpu-performance-governor.service` | keep the `performance` governor across reboots |
