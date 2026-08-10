@@ -17,6 +17,10 @@ Measured between a Threadripper PRO 3995WX and a 2013 Dell Precision T7610:
 and packet headers are accounted for.  Before this work, PSM2 crashed the kernel
 and Verbs managed 50 Gb/s on the same path.
 
+Both directions at once come to about **140 Gb/s aggregate, ~70 Gb/s each way**
+— but only with 24-32 process pairs.  Four pairs, the one-way optimum, is the
+worst bidirectional choice and reports 41.8 Gb/s.
+
 Latency, half round-trip, same pair of hosts:
 
 | | 8 B | 64 KiB | 1 MiB |

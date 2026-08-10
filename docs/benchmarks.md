@@ -183,6 +183,58 @@ cores execute more slowly.  The engine skew and interrupt rate are measured
 contributors; since rearranging QPs, processes, cores and SLs never lifted the
 plateau, the skew alone is not proven to be the single binding constraint.
 
+## Bidirectional bandwidth
+
+Everything above is one-way.  The link is full duplex, so it is worth asking
+what both directions at once come to.  `mpi_bw` mode 2 has every rank post its
+receives and its sends together; the reported aggregate counts both directions,
+so on a full-duplex link it can exceed the one-way line rate.
+
+8 MiB messages, window 8, aggregate over both directions:
+
+| process pairs | aggregate | per direction |
+| --- | --- | --- |
+| 2 | 18.90 | 9.5 |
+| 4 | 41.81, 41.66, 40.68 | ~21 |
+| 8 | 115.27 | 57.6 |
+| 16 | 129.27, 120.57, 115.84 | ~60 |
+| 24 | 145.47, 131.26 | ~69 |
+| 32 | **140.14, 139.94** | **~70** |
+
+So the pair sustains about **140 Gb/s of traffic, roughly 70 Gb/s in each
+direction at the same time** — more than one direction alone carries, but well
+short of twice it.
+
+The parallelism story inverts here.  Four pairs is the optimum one-way and is
+the *worst* possible choice bidirectionally: at four pairs the aggregate is
+41.8 Gb/s, less than half what one direction manages alone.  Each host now has
+to send and receive at once, so it needs far more processes to keep both halves
+fed — 24 to 32 rather than 4.  Anyone quoting a bidirectional figure from a
+four-pair run would understate the link by a factor of three.
+
+Bidirectional runs are also noticeably noisier than one-way ones: 115.8 to
+129.3 Gb/s across three runs at 16 pairs, against a fraction of a percent for
+one-way runs of the same length.
+
+Verified against the HFI counters: a 16-pair run reporting 115.84 Gb/s moved
+168.3 GiB out of WRX80 and 168.6 GiB into it, against 165 GiB of payload in each
+direction — the expected ~2% of protocol overhead, in both directions at once.
+
+Forcing eager instead of rendezvous costs bandwidth here as well: at 8 pairs,
+86.76 Gb/s eager against 115.27 rendezvous.
+
+### `ib_write_bw -b` does not complete
+
+perftest's own bidirectional mode fails on this setup:
+
+```
+Failed to complete run_iter_bw function successfully
+```
+
+at 4, 8 and 16 QPs, while the same command without `-b` runs normally (88.40
+Gb/s).  This was not investigated further; the PSM2 measurement above stands on
+its own and is counter-verified.
+
 ## Latency
 
 `tools/mpi_lat.c` is a two-host ping-pong reporting half round-trip time, with
@@ -306,6 +358,10 @@ ib_write_bw -d hfi1_0 -i 1 -s 8388608 -q 8 -F --report_gbits -D 20 <server> # cl
 ```
 
 ```bash
+# Bidirectional (mode 2); needs far more pairs than a one-way run
+mpirun --hostfile hf -np 64 --map-by ppr:32:node --mca pml cm --mca mtl psm2 \
+       --bind-to none hfi_local_run mpi_bw 8388608 8 82 2
+
 # Latency, and the eager/TID comparison
 mpirun --hostfile hf -np 2 --map-by ppr:1:node --mca pml cm --mca mtl psm2 \
        --bind-to none hfi_local_run mpi_lat 5000
