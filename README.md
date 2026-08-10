@@ -18,8 +18,10 @@ and packet headers are accounted for.  Before this work, PSM2 crashed the kernel
 and Verbs managed 50 Gb/s on the same path.
 
 Both directions at once come to about **140 Gb/s aggregate, ~70 Gb/s each way**
-— but only with 24-32 process pairs.  Four pairs, the one-way optimum, is the
-worst bidirectional choice and reports 41.8 Gb/s.
+(Verbs: ~100 Gb/s) — but only with 24-32 process pairs.  Four pairs, the one-way
+optimum, is the worst bidirectional choice and reports 41.8 Gb/s.  Verbs also
+needs `-u 18` or more: at the default QP timeout the RC transport exhausts its
+retry budget under bidirectional load and the run aborts.
 
 Latency, half round-trip, same pair of hosts:
 

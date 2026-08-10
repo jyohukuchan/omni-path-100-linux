@@ -223,17 +223,65 @@ direction — the expected ~2% of protocol overhead, in both directions at once.
 Forcing eager instead of rendezvous costs bandwidth here as well: at 8 pairs,
 86.76 Gb/s eager against 115.27 rendezvous.
 
-### `ib_write_bw -b` does not complete
+### Verbs bidirectional, and why `ib_write_bw -b` appeared to be broken
 
-perftest's own bidirectional mode fails on this setup:
+`ib_write_bw -b` initially failed at 4, 8 and 16 QPs with
 
 ```
 Failed to complete run_iter_bw function successfully
 ```
 
-at 4, 8 and 16 QPs, while the same command without `-b` runs normally (88.40
-Gb/s).  This was not investigated further; the PSM2 measurement above stands on
-its own and is counter-verified.
+It is not a perftest defect and not a driver defect.  The full error is
+
+```
+Completion with error at client
+Failed status 12: wr_id 3 syndrom 0x0
+```
+
+`IBV_WC_RETRY_EXC_ERR`: the RC transport exhausted its retry budget.  A QP
+sweep puts the boundary at six QPs — 2, 3, 4 and 5 complete, 6 and 8 do not —
+and the HFI counters over one failing run show what happens:
+
+| counter | WRX80 (sender) | T7610 (receiver) |
+| --- | --- | --- |
+| `RcResend` | 247,014 | 0 |
+| `RcTimeOut` | 60 | 0 |
+| `PktDrop` | 0 | 242,410 |
+
+Packets go unacknowledged, the sender retransmits, and after enough consecutive
+timeouts on one work request the QP goes to error.  perftest's default local ACK
+timeout is `-u 14`, which is 4.096 us * 2^14 = 67 ms.  Raising it is enough:
+
+| `-u` | timeout | result at 8 QPs |
+| --- | --- | --- |
+| 14 (default) | 67 ms | status 12 |
+| 18 | 1.07 s | 66.00 Gb/s |
+| 20 | 4.29 s | 102.05 Gb/s |
+
+So the default retry budget, not the hardware, is what failed.  With an adequate
+timeout, Verbs bidirectional measures:
+
+| QPs | aggregate |
+| --- | --- |
+| 6 | 77.73 |
+| 8 | **102.05, 99.90, 98.67** |
+| 12 | 71.66 |
+| 16 | 80.24 |
+
+about 100 Gb/s against PSM2's 140.
+
+A caveat on the mechanism: `PktDrop` is a software counter that hfi1 bumps from
+several places, including the path that handles packets arriving for a QP that
+is no longer in a receiving state, so some of those 242,410 are an effect of
+QPs going down rather than its cause.  What is solid is the observable chain —
+retransmissions, transport timeouts, retry exhaustion — and that a larger
+timeout removes the failure.
+
+The underlying cause is the same T7610 limitation described above: under
+bidirectional load it cannot drain what arrives, and the default retry budget is
+too small to ride that out.  PSM2 carries the same load without difficulty
+because it does its own pacing and retransmission rather than relying on the RC
+transport's fixed timers.
 
 ## Latency
 
